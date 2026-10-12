@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+import math
+import os
+from pathlib import Path
+
+
+SUPPORTED_LANES = (2, 4, 6, 8)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_ONLINE_MODEL_DIR = Path(
+    "/var/lib/sm-sdk/models/asr/"
+    "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
+)
+DEFAULT_OFFLINE_MODEL_DIR = Path("/var/lib/sm-sdk/models/asr/qwen3asr")
+DEFAULT_INPUT_DIR = Path(__file__).resolve().parent / "assets" / "wav16k"
+DEFAULT_SHARED_RUNTIME_DIR = PROJECT_ROOT / "multi-asr-runtime"
+DEFAULT_VAD_MODEL_DIR = Path("/var/lib/sm-sdk/models/vad/silero-vad/v5")
+DEFAULT_OFFLINE_ASR_MODEL_DIR = Path("/var/lib/sm-sdk/models/asr/sensevoice")
+DEFAULT_SUMMARY_CONFIG_PATH = PROJECT_ROOT / "summary.yaml"
+DEFAULT_KWS_MODEL_DIR = Path(
+    "/var/lib/sm-sdk/models/kws/"
+    "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+)
+DEFAULT_KWS_KEYWORDS_FILE = PROJECT_ROOT / "config" / "keywords.txt"
+ZIPFORMER_WARMUP_AUDIO_PATH = (
+    Path(__file__).resolve().parent / "assets" / "zipformer_warmup.wav"
+)
+
+
+@dataclass(frozen=True)
+class KWSConfig:
+    """Keyword spotting (sherpa-onnx zipformer KWS)."""
+
+    enabled: bool = True
+    model_dir: Path = DEFAULT_KWS_MODEL_DIR
+    keywords_file: Path = DEFAULT_KWS_KEYWORDS_FILE
+    num_threads: int = 1
+    max_active_paths: int = 4
+    num_trailing_blanks: int = 1
+    keywords_score: float = 1.0
+    keywords_threshold: float = 0.25
+    provider: str = "cpu"
+    sample_rate: int = 16000
+    repeat_interval: float = 1.0
+
+
+@dataclass(frozen=True)
+class OfflineModelSpec:
+    model_id: str
+    model_dir: Path
+    text_model_filename: str
+    frontend_filename: str
+    backend_filename: str
+    d_model: int
+    hidden_size: int
+    output_dim: int
+
+    @property
+    def required_filenames(self) -> tuple[str, str, str]:
+        return (
+            self.text_model_filename,
+            self.frontend_filename,
+            self.backend_filename,
+        )
+
+
+OFFLINE_MODELS = {
+    "qwen3-asr-0.6b-q40": OfflineModelSpec(
+        model_id="qwen3-asr-0.6b-q40",
+        model_dir=DEFAULT_OFFLINE_MODEL_DIR,
+        text_model_filename="Qwen3-ASR-0.6B-text-q40.gguf",
+        frontend_filename="Qwen3-ASR-0.6B-encoder-frontend.dynq.onnx",
+        backend_filename="Qwen3-ASR-0.6B-encoder-backend.dynq.onnx",
+        d_model=896,
+        hidden_size=1024,
+        output_dim=1024,
+    ),
+    "qwen3-asr-1.7b-q4km": OfflineModelSpec(
+        model_id="qwen3-asr-1.7b-q4km",
+        model_dir=Path("/var/lib/sm-sdk/models/asr/qwen3asr-1.7b"),
+        text_model_filename="Qwen3-ASR-1.7B-text-q4km.gguf",
+        frontend_filename="Qwen3-ASR-1.7B-encoder-frontend.dynq.onnx",
+        backend_filename="Qwen3-ASR-1.7B-encoder-backend.dynq.onnx",
+        d_model=1024,
+        hidden_size=2048,
+        output_dim=2048,
+    ),
+    # SpacemiT 官方转换的 1.7B 生产包（2026-08-04 启用，替换 0.6B 以提升准确率）
+    "qwen3-asr-1.7b-q40": OfflineModelSpec(
+        model_id="qwen3-asr-1.7b-q40",
+        model_dir=Path("/var/lib/sm-sdk/models/asr/qwen3asr-1.7b"),
+        text_model_filename="Qwen3-ASR-1.7B-text-q4km.gguf",
+        frontend_filename="Qwen3-ASR-1.7B-encoder-frontend.dynq.onnx",
+        backend_filename="Qwen3-ASR-1.7B-encoder-backend.dynq.onnx",
+        d_model=1024,
+        hidden_size=2048,
+        output_dim=2048,
+    ),
+}
+
+
+@dataclass(frozen=True)
+class LaneInputConfig:
+    kind: str = "default_files"
+    local_wav_path: Path | None = None
+    microphone_device: int | None = None
+    microphone_device_id: str | None = None
+    loop_audio: bool = False
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"default_files", "local_wav", "microphone"}:
+            raise ValueError(f"unsupported lane input kind: {self.kind}")
+        if self.kind == "local_wav" and self.local_wav_path is None:
+            raise ValueError("local_wav requires local_wav_path")
+        if self.kind != "local_wav" and self.local_wav_path is not None:
+            raise ValueError("only local_wav accepts local_wav_path")
+        if self.kind != "microphone" and self.microphone_device is not None:
+            raise ValueError("only microphone accepts microphone_device")
+        if self.kind != "microphone" and self.microphone_device_id is not None:
+            raise ValueError("only microphone accepts microphone_device_id")
+        if self.kind == "microphone" and self.loop_audio:
+            raise ValueError("only file inputs accept loop_audio")
+        if not isinstance(self.loop_audio, bool):
+            raise ValueError("loop_audio must be a boolean")
+        if self.microphone_device is not None and (
+            not isinstance(self.microphone_device, int)
+            or isinstance(self.microphone_device, bool)
+        ):
+            raise ValueError("microphone_device must be an integer or null")
+        if (
+            self.microphone_device_id is not None
+            and not self.microphone_device_id.strip()
+        ):
+            raise ValueError("microphone_device_id must be non-empty")
+
+
+def validate_offline_model_files(spec: OfflineModelSpec) -> list[Path]:
+    model_directory = spec.model_dir.expanduser().resolve(strict=True)
+    invalid_files: list[Path] = []
+    for filename in spec.required_filenames:
+        required_path = model_directory / filename
+        try:
+            resolved_path = required_path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            invalid_files.append(required_path)
+            continue
+        if (
+            not resolved_path.is_relative_to(model_directory)
+            or not resolved_path.is_file()
+            or not os.access(resolved_path, os.R_OK)
+        ):
+            invalid_files.append(required_path)
+    return invalid_files
+
+
+@dataclass(frozen=True)
+class EndpointConfig:
+    rule1_min_trailing_silence: float = 1.0
+    rule2_min_trailing_silence: float = 0.7
+    rule3_min_utterance_length: float = 10.0
+    cut_margin_seconds: float = 0.1
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.cut_margin_seconds) or not (
+            0.0 <= self.cut_margin_seconds < self.rule2_min_trailing_silence
+        ):
+            raise ValueError(
+                "cut_margin_seconds must be finite, non-negative, and less than "
+                "rule2_min_trailing_silence"
+            )
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    online_model_dir: Path = DEFAULT_ONLINE_MODEL_DIR
+    # 2026-08-04 起默认使用官方 1.7B（热词能力+准确率更好）；
+    # 回退 0.6B：改为 "qwen3-asr-0.6b-q40" 且 offline_model_dir 改回 DEFAULT_OFFLINE_MODEL_DIR
+    offline_model_id: str = "qwen3-asr-1.7b-q4km"
+    offline_model_dir: Path = Path("/var/lib/sm-sdk/models/asr/qwen3asr-1.7b")
+    online_num_threads: int = 1
+
+    def __post_init__(self) -> None:
+        if self.offline_model_id not in OFFLINE_MODELS:
+            raise ValueError(f"unsupported offline model: {self.offline_model_id}")
+
+    @property
+    def offline_model(self) -> OfflineModelSpec:
+        # 按目录实际内容自动匹配规格：切换不同家族版本（1.7B↔0.6B）时
+        # 文件名和维度参数不同，以目录里真实存在的文件为准选 spec
+        d = self.offline_model_dir
+        try:
+            names = {p.name for p in d.iterdir() if p.is_file()}
+        except OSError:
+            names = set()
+        for spec in OFFLINE_MODELS.values():
+            if all(fn in names for fn in spec.required_filenames):
+                return replace(spec, model_dir=d)
+        return replace(
+            OFFLINE_MODELS[self.offline_model_id],
+            model_dir=self.offline_model_dir,
+        )
+
+
+@dataclass(frozen=True)
+class SharedQwenConfig:
+    host: str = "127.0.0.1"
+    port: int = 8090
+    runtime_dir: Path = DEFAULT_SHARED_RUNTIME_DIR
+    encoder_thread_num: int = 2
+    encoder_affinity: str = "8;9"
+    decoder_cores: str = "10,11,12,13,14,15"
+    decoder_threads: int = 6
+    n_parallel: int = 4
+    n_ctx: int = 8192
+    request_timeout_ms: int = 120000
+
+
+@dataclass(frozen=True)
+class LaneConfig:
+    stream_id: int
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    lanes: int = 4
+    frame_duration_ms: int = 100
+    input_dir: Path = DEFAULT_INPUT_DIR
+    endpoint: EndpointConfig = field(default_factory=EndpointConfig)
+    models: ModelConfig = field(default_factory=ModelConfig)
+    shared_qwen: SharedQwenConfig = field(default_factory=SharedQwenConfig)
+    lane_inputs: tuple[LaneInputConfig, ...] = ()
+    output_dir: Path = Path("output").resolve()
+    verbose: bool = False
+    # Web API settings
+    web_port: int = 8060
+    max_concurrent_sessions: int = 8
+    vad_model_dir: Path = DEFAULT_VAD_MODEL_DIR
+    offline_asr_model_dir: Path = DEFAULT_OFFLINE_ASR_MODEL_DIR
+    summary_config_path: Path = DEFAULT_SUMMARY_CONFIG_PATH
+    speexdsp_lib_path: Path | None = None
+    kws: KWSConfig = field(default_factory=KWSConfig)
+    sensitive_words_file: Path = Path("config/sensitive_words.txt")
+    hotwords_file: Path = Path("config/hotwords.txt")
+    hotwords_score: float = 1.5
+    # 唤醒后限时转写秒数（0=不限时），可经 /v1/config/wakeup 运行时调整
+    wakeup_window_seconds: float = 30.0
+    # 在线 Zipformer 热词偏置开关。当前板子的 SpacemiT sherpa-onnx 的
+    # modified_beam_search 不生效（2026-08-04 实测）且慢约 8%，默认关闭，
+    # 热词只注入离线 Qwen 精修 prompt；将来推理库修复后可打开。
+    hotwords_online: bool = False
+
+    def __post_init__(self) -> None:
+        if self.lanes not in SUPPORTED_LANES:
+            raise ValueError(f"lanes must be one of {SUPPORTED_LANES}, got {self.lanes}")
+        if self.lane_inputs and len(self.lane_inputs) != self.lanes:
+            raise ValueError("lane_inputs must be empty or match lanes")
+
+    @property
+    def segment_cache_seconds(self) -> float:
+        return 1.5 * self.endpoint.rule3_min_utterance_length
+
+    @property
+    def lane_configs(self) -> list[LaneConfig]:
+        return build_lane_configs(self.lanes)
+
+    def input_for_lane(self, stream_id: int) -> LaneInputConfig:
+        if stream_id < 0 or stream_id >= self.lanes:
+            raise ValueError(f"stream_id out of range: {stream_id}")
+        if self.lane_inputs:
+            return self.lane_inputs[stream_id]
+        return LaneInputConfig()
+
+
+def build_lane_configs(lanes: int) -> list[LaneConfig]:
+    if lanes not in SUPPORTED_LANES:
+        raise ValueError(f"lanes must be one of {SUPPORTED_LANES}, got {lanes}")
+    return [LaneConfig(stream_id=stream_id) for stream_id in range(lanes)]

@@ -1,0 +1,54 @@
+summary:
+  enabled: true
+  # local: 不依赖外部模型，基于最终转写文本生成基础纪要
+  # llama: 自动启动本地 llama-server，并调用 /v1/chat/completions 生成纪要
+  # openai: 调用已有 OpenAI 兼容 /v1/chat/completions 接口生成纪要
+  # ollama: 复用 ASR_Control 的本地 Ollama /api/chat 方案
+  provider: "llama"
+  offline_enabled: true
+  realtime_enabled: true
+  base_url: ""
+  api_key: ""
+  model: "Qwen3.5-2B-Q4_0"
+  model_path: "/var/lib/llm-sdk/models/llm/Qwen3.5-2B-Q4_0.gguf"
+  llama_server_bin: "llama-server"
+  host: "127.0.0.1"
+  port: 8065
+  ctx_size: 8102
+  num_threads: 8
+  n_gpu_layers: 0
+  temperature: 0.2
+  timeout: 600
+  max_input_chars: 2000
+  max_tokens: 1024
+  min_text_chars: 20
+  realtime_min_chars: 80
+  fallback_on_error: true
+  enable_thinking: false
+  transcript_dir: "outputs/transcripts"
+  language: "zh"
+  prompt: ""
+  prompt_template: |
+    /no_think
+    你是语音内容摘要助手。请根据转写文本生成中文核心内容总结。
+
+    目标：
+    用少量要点让读者快速理解音频主要内容与关键信息。
+
+    要求：
+    1. 只基于原文，不得补充或推测
+    2. 必须归纳总结，不逐句复述
+    3. 抓取核心信息：在说什么、发生了什么、讨论了什么
+    4. 保留关键事实：人名、事项、结论、决定、问题、时间
+    5. 去除口语、重复、无意义填充
+    6. 最多3-5条要点（视内容而定）
+
+    输出格式：
+    - 要点1
+    - 要点2
+    - 要点3
+    - 要点4（如有必要）
+    - 要点5（如有必要）
+
+    转写内容：
+    {text}

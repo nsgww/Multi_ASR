@@ -1,0 +1,1193 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Multi-Stream ASR Web 界面使用教程（离线模拟）</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, "Segoe UI", Arial, "Microsoft YaHei", sans-serif;
+        --accent: #b0e237;
+        --accent-soft: #edffdc;
+        --accent-deep: #5d7d00;
+        --canvas: #f5f6f2;
+        --surface: #ffffff;
+        --ink: #171b16;
+        --muted: #697065;
+        --border: #dce1d7;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--canvas);
+        color: var(--ink);
+      }
+
+      .tutorial-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 340px;
+        height: 100dvh;
+        overflow: hidden;
+      }
+
+      /* ---------- 模拟的应用界面（与真实前端一致） ---------- */
+      .app-shell {
+        min-height: 0;
+        overflow: hidden;
+        display: grid;
+        grid-template-rows: auto auto auto auto minmax(0, 1fr);
+        background: var(--canvas);
+      }
+
+      .demo-banner {
+        padding: 6px 20px;
+        font-size: 13px;
+        background: var(--accent-soft);
+        color: var(--accent-deep);
+        border-bottom: 1px solid #cfe8a4;
+      }
+
+      .toolbar,
+      .status-row,
+      .configuration-panel {
+        padding: 12px 20px;
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .toolbar,
+      .status-row,
+      .configuration-panel,
+      .control-group,
+      .lane-input-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .toolbar {
+        flex-wrap: wrap;
+        padding-block: 14px;
+        color: #f8fbf4;
+        background: #171b16;
+        border-bottom-color: #171b16;
+      }
+      .status-row { justify-content: space-between; }
+      .configuration-panel { align-items: flex-start; flex-wrap: wrap; }
+      .control-group { flex-wrap: wrap; }
+
+      label { font-size: 14px; color: var(--muted); }
+      input, select, button { font: inherit; min-height: 34px; }
+      input, select { border: 1px solid var(--border); border-radius: 5px; background: var(--surface); padding: 0 8px; color: var(--ink); }
+      button { border: 1px solid var(--border); border-radius: 5px; background: var(--surface); padding: 0 12px; color: var(--ink); cursor: pointer; transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease; }
+      button:hover:not(:disabled) { border-color: #aeb8a5; background: #f7f9f4; }
+      button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid rgb(176 226 55 / 48%); outline-offset: 2px; }
+      .toolbar button { color: #f8fbf4; background: rgb(255 255 255 / 10%); border-color: rgb(255 255 255 / 23%); }
+      .toolbar button:hover:not(:disabled) { background: rgb(255 255 255 / 18%); border-color: rgb(255 255 255 / 42%); }
+      .toolbar #load-models, .toolbar #start-recognition { color: #1d2519; background: var(--accent); border-color: var(--accent); font-weight: 700; }
+      .toolbar #load-models:hover:not(:disabled), .toolbar #start-recognition:hover:not(:disabled) { background: #c6eb61; border-color: #c6eb61; }
+      button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
+      .path-output {
+        min-width: min(360px, 50vw);
+        min-height: 34px;
+        display: inline-flex;
+        align-items: center;
+        padding: 0 8px;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        background: var(--surface);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .lane-input-row .path-output { min-width: 0; flex: 1; }
+      .icon-button { width: 34px; min-width: 34px; padding: 0; font-size: 18px; }
+      .metrics { font-size: 14px; color: var(--muted); }
+      .toolbar .metrics { color: #d8e0d0; }
+      .hidden { display: none !important; }
+
+      #path-picker-dialog {
+        width: min(680px, calc(100vw - 380px));
+        max-width: 680px;
+        padding: 0;
+        color: var(--ink);
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        box-shadow: 0 20px 55px rgb(23 27 22 / 26%);
+      }
+
+      #path-picker-dialog::backdrop { background: rgb(23 27 22 / 45%); }
+      .path-picker-header,
+      .path-picker-toolbar,
+      .path-picker-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px;
+      }
+      .path-picker-header { justify-content: space-between; border-bottom: 1px solid var(--border); }
+      .path-picker-header h2 { margin: 0; font-size: 18px; }
+      .path-picker-toolbar { border-bottom: 1px solid var(--border); background: #fafcf7; }
+      #path-picker-current-path { min-width: 0; flex: 1; }
+      #path-picker-entries {
+        height: 280px;
+        margin: 0;
+        padding: 0;
+        overflow-y: auto;
+        list-style: none;
+      }
+      .path-picker-entry {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        text-align: left;
+        border: 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .path-picker-entry[aria-selected="true"] { background: var(--accent-soft); }
+      .path-picker-entry-icon { width: 18px; text-align: center; }
+      .path-picker-actions { justify-content: flex-end; border-top: 1px solid var(--border); }
+
+      #operation-status { margin: 0; padding: 8px 20px; min-height: 34px; color: var(--muted); }
+      #configuration-error {
+        margin: 0;
+        padding: 8px 20px;
+        white-space: pre-wrap;
+        color: #b91c1c;
+        background: #fff4f2;
+        border-bottom: 1px solid #f4c7bd;
+      }
+
+      .lane-input-config {
+        width: 100%;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+        gap: 8px;
+      }
+
+      .lane-input-row {
+        min-width: 0;
+        padding: 8px;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        background: #fafcf7;
+        flex-wrap: nowrap;
+      }
+      .lane-input-row > strong { flex: 0 0 auto; white-space: nowrap; }
+      .lane-input-row label { display: flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
+      .input-kind { width: 128px; min-width: 0; }
+      .microphone-device {
+        flex: 1 1 0;
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .lane-grid {
+        min-height: 0;
+        overflow: hidden;
+        display: grid;
+        gap: 12px;
+        padding: 12px 20px 20px;
+      }
+
+      .lane-grid[data-lanes="2"] { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: 1fr; }
+      .lane-grid[data-lanes="4"] { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: repeat(2, 1fr); }
+      .lane-grid[data-lanes="6"] { grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-rows: repeat(2, 1fr); }
+      .lane-grid[data-lanes="8"] { grid-template-columns: repeat(4, minmax(0, 1fr)); grid-template-rows: repeat(2, 1fr); }
+
+      .lane {
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto auto minmax(0, 1fr);
+        position: relative;
+        overflow: hidden;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        box-shadow: 0 4px 16px rgb(23 27 22 / 6%);
+      }
+
+      .lane::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--accent); }
+
+      .lane header,
+      .lane .lane-metrics { padding: 10px 12px; border-bottom: 1px solid #e5e7eb; }
+      .lane header { padding-left: 15px; font-weight: 700; }
+      .lane .lane-metrics { font-size: 13px; color: var(--muted); }
+
+      .lane .results {
+        min-height: 0;
+        overflow-y: auto;
+        padding: 12px;
+        display: grid;
+        gap: 8px;
+        align-content: start;
+      }
+
+      .result { padding: 7px 9px; border-radius: 5px; background: #fafcf7; line-height: 1.45; }
+      .result.partial, .result.pending { color: var(--muted); }
+      .result.final { color: var(--ink); }
+      .result.fatal_error { color: #b91c1c; }
+      .result.qwen_error { color: #9a3412; font-size: 12px; }
+
+      /* ---------- 教程面板 ---------- */
+      .tutorial-panel {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr) auto;
+        background: var(--surface);
+        color: var(--ink);
+        border-left: 1px solid var(--border);
+        box-shadow: -4px 0 16px rgb(23 27 22 / 4%);
+      }
+      .tutorial-panel header {
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--border);
+      }
+      .tutorial-panel header h1 { margin: 0 0 4px; font-size: 17px; }
+      .tutorial-panel header p { margin: 0; font-size: 12px; color: var(--muted); }
+      .tutorial-body {
+        overflow-y: auto;
+        padding: 16px;
+        font-size: 14px;
+        line-height: 1.7;
+      }
+      .tutorial-body h2 { margin: 0 0 10px; font-size: 16px; color: var(--accent-deep); }
+      .tutorial-body p { margin: 0 0 10px; }
+      .tutorial-body code {
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: var(--accent-soft);
+        color: var(--accent-deep);
+        font-size: 13px;
+      }
+      .tutorial-body ul { margin: 0 0 10px; padding-left: 20px; }
+      .tutorial-body li { margin-bottom: 4px; }
+      .try-it {
+        margin: 10px 0;
+        padding: 10px 12px;
+        border-left: 3px solid var(--accent);
+        background: #f4faea;
+        border-radius: 0 6px 6px 0;
+      }
+      .try-it strong { color: var(--accent-deep); }
+      .tutorial-footer {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        padding: 12px 16px;
+        border-top: 1px solid var(--border);
+      }
+      .tutorial-footer .step-indicator {
+        grid-column: 1 / -1;
+        text-align: center;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .tutorial-footer button {
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--ink);
+        border-radius: 5px;
+      }
+      .tutorial-footer button:hover:not(:disabled) { background: #f7f9f4; }
+      .tutorial-footer #tutorial-next { color: #1d2519; background: var(--accent); border-color: var(--accent); font-weight: 700; }
+      .tutorial-footer #tutorial-reset {
+        grid-column: 1 / -1;
+        background: transparent;
+        color: var(--muted);
+        border-style: dashed;
+      }
+
+      /* 高亮教程指向的界面元素 */
+      .tutorial-highlight {
+        outline: 3px solid var(--accent);
+        outline-offset: 3px;
+        border-radius: 4px;
+        animation: tutorial-pulse 1.4s ease-in-out infinite;
+      }
+      @keyframes tutorial-pulse {
+        0%, 100% { outline-color: var(--accent); }
+        50% { outline-color: #d2f77a; }
+      }
+
+      @media (max-width: 1000px) {
+        .tutorial-layout {
+          grid-template-columns: 1fr;
+          grid-template-rows: minmax(0, 1fr) auto;
+          height: auto;
+          min-height: 100dvh;
+          overflow: auto;
+        }
+        .app-shell { overflow: visible; height: auto; }
+        .lane-grid { min-height: 60vh; overflow: visible; }
+        .lane-grid[data-lanes] { grid-template-columns: 1fr; grid-template-rows: none; }
+        .lane { min-height: 240px; }
+        .tutorial-panel { border-left: 0; border-top: 1px solid var(--border); }
+        .tutorial-body { max-height: 40vh; }
+        #path-picker-dialog { width: min(680px, calc(100vw - 32px)); }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="tutorial-layout">
+      <!-- ===================== 模拟应用 ===================== -->
+      <div class="app-shell">
+        <div class="demo-banner">
+          教学演示模式：本页面不连接任何后端服务，所有操作与识别结果均为浏览器内模拟，可放心随意点击。
+        </div>
+        <div class="toolbar">
+          <div class="control-group">
+            <button id="load-models" type="button">Load Models</button>
+            <button id="unload-models" type="button">Unload Models</button>
+            <button id="start-recognition" type="button">Start Recognition</button>
+            <button id="stop-recognition" type="button">Stop Recognition</button>
+          </div>
+          <span id="connection-state" class="metrics">Connected (simulated)</span>
+        </div>
+
+        <div class="status-row">
+          <div id="server-state">State: unloaded</div>
+          <div id="summary-metrics" class="metrics">Events: 0</div>
+        </div>
+
+        <section id="configuration-panel" class="configuration-panel">
+          <div class="control-group">
+            <label for="lane-count">Lanes</label>
+            <select id="lane-count">
+              <option value="2">2</option>
+              <option value="4" selected>4</option>
+              <option value="6">6</option>
+              <option value="8">8</option>
+            </select>
+            <label for="offline-model">Offline model</label>
+            <select id="offline-model">
+              <option value="qwen3-asr-0.6b-q40">Qwen3-ASR 0.6B q40</option>
+              <option value="qwen3-asr-1.7b-q4km">Qwen3-ASR 1.7B q4km</option>
+            </select>
+            <label for="offline-model-dir">Model directory</label>
+            <output id="offline-model-dir" class="path-output"></output>
+            <button id="offline-model-picker" class="icon-button" type="button" aria-label="Choose model directory" title="Choose model directory">&hellip;</button>
+          </div>
+          <div id="lane-input-config" class="lane-input-config"></div>
+        </section>
+
+        <div>
+          <p id="operation-status" role="status"></p>
+          <pre id="configuration-error" class="hidden" role="alert"></pre>
+        </div>
+
+        <main id="lane-grid" class="lane-grid" data-lanes="4"></main>
+      </div>
+
+      <!-- ===================== 教程面板 ===================== -->
+      <aside class="tutorial-panel">
+        <header>
+          <h1>Web 界面使用教程</h1>
+          <p>左侧是可交互的界面模拟，按步骤学习即可</p>
+        </header>
+        <div id="tutorial-body" class="tutorial-body"></div>
+        <div class="tutorial-footer">
+          <span id="step-indicator" class="step-indicator"></span>
+          <button id="tutorial-prev" type="button">&larr; 上一步</button>
+          <button id="tutorial-next" type="button">下一步 &rarr;</button>
+          <button id="tutorial-reset" type="button">重置演示</button>
+        </div>
+      </aside>
+    </div>
+
+    <dialog id="path-picker-dialog" aria-labelledby="path-picker-title">
+      <div class="path-picker-header">
+        <h2 id="path-picker-title">Choose path</h2>
+        <button id="path-picker-close" class="icon-button" type="button" aria-label="Close path picker" title="Close">&times;</button>
+      </div>
+      <div class="path-picker-toolbar">
+        <button id="path-picker-up" class="icon-button" type="button" aria-label="Up one directory" title="Up">&uarr;</button>
+        <output id="path-picker-current-path" class="path-output"></output>
+      </div>
+      <ul id="path-picker-entries" aria-label="Path entries"></ul>
+      <div class="path-picker-actions">
+        <button id="path-picker-cancel" type="button">Cancel</button>
+        <button id="path-picker-select" type="button">Select</button>
+      </div>
+    </dialog>
+
+    <script>
+      "use strict";
+
+      /* =========================================================
+       * 模拟后端：文件系统、麦克风设备、模型校验、识别事件流。
+       * 真实部署中这些数据来自 /api/* 与 /ws WebSocket。
+       * ========================================================= */
+
+      const FAKE_FS = {
+        "/": ["home", "data"],
+        "/home": ["user"],
+        "/home/user": ["Music"],
+        "/home/user/Music": ["wav16k"],
+        "/home/user/Music/wav16k": [
+          "meeting-zh-001.wav", "meeting-zh-002.wav",
+          "news-zh-001.wav", "podcast-en-001.wav",
+        ],
+        "/data": ["models"],
+        "/data/models": ["asr"],
+        "/data/models/asr": ["qwen3asr", "qwen3asr-1.7b", "empty-model-dir", "zipformer"],
+        "/data/models/asr/qwen3asr": [
+          "Qwen3-ASR-0.6B-text-q40.gguf",
+          "encoder-0.6b-dynq-part1.onnx",
+          "encoder-0.6b-dynq-part2.onnx",
+        ],
+        "/data/models/asr/qwen3asr-1.7b": [
+          "Qwen3-ASR-1.7B-text-q4km.gguf",
+          "encoder-1.7b-dynq-part1.onnx",
+          "encoder-1.7b-dynq-part2.onnx",
+        ],
+        "/data/models/asr/empty-model-dir": [],
+        "/data/models/asr/zipformer": ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"],
+      };
+
+      const MODEL_DEFAULT_DIRS = {
+        "qwen3-asr-0.6b-q40": "/data/models/asr/qwen3asr",
+        "qwen3-asr-1.7b-q4km": "/data/models/asr/qwen3asr-1.7b",
+      };
+
+      const MODEL_REQUIRED_FILES = {
+        "qwen3-asr-0.6b-q40": [
+          "Qwen3-ASR-0.6B-text-q40.gguf",
+          "encoder-0.6b-dynq-part1.onnx",
+          "encoder-0.6b-dynq-part2.onnx",
+        ],
+        "qwen3-asr-1.7b-q4km": [
+          "Qwen3-ASR-1.7B-text-q4km.gguf",
+          "encoder-1.7b-dynq-part1.onnx",
+          "encoder-1.7b-dynq-part2.onnx",
+        ],
+      };
+
+      const FAKE_MICROPHONES = [
+        { index: 0, name: "USB Audio Device (hw:1,0)" },
+        { index: 1, name: "Built-in Analog Stereo" },
+      ];
+
+      const FAKE_SENTENCES = [
+        ["今天的会议主要讨论第三季度的产品规划。", "请各位负责人先同步一下进度。"],
+        ["昨天的系统升级已经完成，服务运行正常。", "监控指标显示平均延迟在五十毫秒左右。"],
+        ["The quick brown fox jumps over the lazy dog.", "Speech recognition latency looks good today."],
+        ["下面进入自由讨论环节，请大家踊跃发言。", "本次录音将自动保存到运行目录。"],
+        ["欢迎收听本期播客节目。", "我们今天邀请到了一位特别嘉宾。"],
+        ["测试音频第六路，信号良好。", "识别结果将实时显示在网页上。"],
+        ["请注意，麦克风输入要求十六千赫兹单声道。", "配置在加载后会变为只读状态。"],
+        ["最终文本会写入 results 目录。", "诊断信息会写入 model_outputs 目录。"],
+      ];
+
+      function fakeListDir(path, selection) {
+        const names = FAKE_FS[path];
+        if (!names) return null;
+        const entries = [];
+        for (const name of names) {
+          const childPath = path === "/" ? `/${name}` : `${path}/${name}`;
+          if (FAKE_FS[childPath] !== undefined) {
+            entries.push({ name, path: childPath, kind: "directory" });
+          } else if (selection === "wav" && name.toLowerCase().endsWith(".wav")) {
+            entries.push({ name, path: childPath, kind: "file" });
+          }
+        }
+        return {
+          current_path: path,
+          parent_path: path === "/" ? null : path.slice(0, path.lastIndexOf("/")) || "/",
+          entries,
+        };
+      }
+
+      function fakeValidateModel(modelId, modelDir) {
+        const files = FAKE_FS[modelDir];
+        const required = MODEL_REQUIRED_FILES[modelId];
+        if (!files) {
+          return { valid: false, missing_files: [`${modelDir} (directory not readable)`] };
+        }
+        const missing = required.filter((name) => !files.includes(name)).map((name) => `${modelDir}/${name}`);
+        return { valid: missing.length === 0, missing_files: missing };
+      }
+
+      /* =========================================================
+       * 应用状态与界面逻辑（与真实前端行为一致）
+       * ========================================================= */
+
+      const appState = {
+        lanes: 4,
+        state: "unloaded",
+        eventCount: 0,
+        laneEntries: new Map(),
+        revisions: new Map(),
+        finishedLanes: new Set(),
+        draft: {
+          offlineModelId: "qwen3-asr-0.6b-q40",
+          offlineModelDir: MODEL_DEFAULT_DIRS["qwen3-asr-0.6b-q40"],
+          laneInputs: [],
+        },
+      };
+
+      const laneSelect = document.getElementById("lane-count");
+      const offlineModelSelect = document.getElementById("offline-model");
+      const offlineModelDirectory = document.getElementById("offline-model-dir");
+      const offlineModelPicker = document.getElementById("offline-model-picker");
+      const laneInputConfig = document.getElementById("lane-input-config");
+      const serverState = document.getElementById("server-state");
+      const summaryMetrics = document.getElementById("summary-metrics");
+      const laneGrid = document.getElementById("lane-grid");
+      const operationStatus = document.getElementById("operation-status");
+      const configurationError = document.getElementById("configuration-error");
+      const loadButton = document.getElementById("load-models");
+      const unloadButton = document.getElementById("unload-models");
+      const startButton = document.getElementById("start-recognition");
+      const stopButton = document.getElementById("stop-recognition");
+      const pathPickerDialog = document.getElementById("path-picker-dialog");
+      const pathPickerClose = document.getElementById("path-picker-close");
+      const pathPickerUp = document.getElementById("path-picker-up");
+      const pathPickerCurrentPath = document.getElementById("path-picker-current-path");
+      const pathPickerEntries = document.getElementById("path-picker-entries");
+      const pathPickerCancel = document.getElementById("path-picker-cancel");
+      const pathPickerSelect = document.getElementById("path-picker-select");
+
+      const pathPicker = { selection: null, currentPath: null, pendingPath: null, parentPath: null, onSelect: null };
+      const simulation = { timers: new Set() };
+      const MAX_DISPLAYED_SENTENCES_PER_LANE = 100;
+
+      function simTimeout(fn, delay) {
+        const id = window.setTimeout(() => { simulation.timers.delete(id); fn(); }, delay);
+        simulation.timers.add(id);
+        return id;
+      }
+
+      function clearSimulationTimers() {
+        for (const id of simulation.timers) window.clearTimeout(id);
+        simulation.timers.clear();
+      }
+
+      function defaultLaneInput() {
+        return { kind: "default_files", local_wav_path: null, microphone_device: null, loop_audio: false };
+      }
+
+      function laneKey(streamId, sentenceId) {
+        return `${streamId}:${sentenceId}`;
+      }
+
+      function eventStorageKey(event) {
+        const isTranscriptEvent = ["partial", "pending", "final"].includes(event.status);
+        return isTranscriptEvent
+          ? laneKey(event.stream_id, event.sentence_id)
+          : `${event.stream_id}:${event.sentence_id}:${event.status}`;
+      }
+
+      function ensureDraftLaneInputs() {
+        while (appState.draft.laneInputs.length < appState.lanes) {
+          appState.draft.laneInputs.push(defaultLaneInput());
+        }
+        appState.draft.laneInputs.length = appState.lanes;
+      }
+
+      function showError(message) {
+        configurationError.textContent = message;
+        configurationError.classList.toggle("hidden", !message);
+      }
+
+      function setOperation(message) {
+        operationStatus.textContent = message;
+      }
+
+      function ensureLane(streamId) {
+        if (appState.laneEntries.has(streamId)) return appState.laneEntries.get(streamId);
+        const section = document.createElement("section");
+        section.className = "lane";
+        section.innerHTML = `<header>Lane ${streamId + 1}</header><div class="lane-metrics">No events yet.</div><div class="results"></div>`;
+        laneGrid.appendChild(section);
+        const lane = {
+          root: section,
+          metrics: section.querySelector(".lane-metrics"),
+          results: section.querySelector(".results"),
+          events: new Map(),
+          rows: new Map(),
+          prunedSentenceId: -1,
+        };
+        appState.laneEntries.set(streamId, lane);
+        return lane;
+      }
+
+      function renderLaneGrid() {
+        laneGrid.dataset.lanes = String(appState.lanes);
+        laneGrid.innerHTML = "";
+        appState.laneEntries.clear();
+        for (let streamId = 0; streamId < appState.lanes; streamId += 1) ensureLane(streamId);
+      }
+
+      function renderLaneInputControls() {
+        ensureDraftLaneInputs();
+        laneInputConfig.innerHTML = "";
+        for (let streamId = 0; streamId < appState.lanes; streamId += 1) {
+          const input = appState.draft.laneInputs[streamId];
+          const row = document.createElement("div");
+          row.className = "lane-input-row";
+          row.innerHTML = `<strong>Lane ${streamId + 1}</strong><label>Input <select class="input-kind"><option value="default_files">Default files</option><option value="local_wav">Local WAV</option><option value="microphone">Microphone</option></select></label><output class="local-wav-path path-output hidden"></output><button class="local-wav-picker icon-button hidden" type="button" aria-label="Choose local WAV file" title="Choose local WAV file">&hellip;</button><select class="microphone-device hidden"></select>`;
+          const kind = row.querySelector(".input-kind");
+          const path = row.querySelector(".local-wav-path");
+          const wavPicker = row.querySelector(".local-wav-picker");
+          const device = row.querySelector(".microphone-device");
+          const loop = document.createElement("label");
+          loop.className = "loop-audio hidden";
+          loop.innerHTML = '<input type="checkbox"> Loop audio';
+          row.appendChild(loop);
+          kind.value = input.kind;
+          path.textContent = input.local_wav_path || "";
+          kind.addEventListener("change", () => {
+            input.kind = kind.value;
+            if (input.kind !== "local_wav") input.local_wav_path = null;
+            if (input.kind !== "microphone") input.microphone_device = null;
+            if (input.kind === "microphone") input.loop_audio = false;
+            updateLaneInputVisibility(row, input);
+            if (input.kind === "microphone") populateMicrophoneDevices(device, input);
+            updateControlAvailability();
+          });
+          wavPicker.addEventListener("click", () => {
+            openPathDialog({
+              selection: "wav",
+              value: input.local_wav_path,
+              onSelect: (selectedPath) => {
+                input.local_wav_path = selectedPath;
+                path.textContent = selectedPath;
+              },
+            });
+          });
+          device.addEventListener("change", () => {
+            input.microphone_device = device.value === "" ? null : Number(device.value);
+          });
+          loop.querySelector("input").addEventListener("change", () => {
+            input.loop_audio = loop.querySelector("input").checked;
+          });
+          laneInputConfig.appendChild(row);
+          updateLaneInputVisibility(row, input);
+          if (input.kind === "microphone") populateMicrophoneDevices(device, input);
+        }
+        updateControlAvailability();
+      }
+
+      function updateLaneInputVisibility(row, input) {
+        row.querySelector(".local-wav-path").classList.toggle("hidden", input.kind !== "local_wav");
+        row.querySelector(".local-wav-picker").classList.toggle("hidden", input.kind !== "local_wav");
+        row.querySelector(".microphone-device").classList.toggle("hidden", input.kind !== "microphone");
+        row.querySelector(".loop-audio").classList.toggle("hidden", input.kind === "microphone");
+        row.querySelector(".loop-audio input").checked = input.loop_audio === true;
+      }
+
+      function populateMicrophoneDevices(select, input) {
+        select.innerHTML = '<option value="">Automatic assignment</option>';
+        for (const device of FAKE_MICROPHONES) {
+          const option = document.createElement("option");
+          option.value = String(device.index);
+          option.textContent = `${device.index}: ${device.name}`;
+          select.appendChild(option);
+        }
+        select.value = input.microphone_device === null ? "" : String(input.microphone_device);
+      }
+
+      function updateControlAvailability() {
+        const modelEditable = appState.state === "unloaded";
+        const recognitionActive = ["starting", "running", "stopping"].includes(appState.state);
+        const laneInputsEditable = ["unloaded", "loaded"].includes(appState.state) && !recognitionActive;
+        const busy = ["loading", "unloading", "starting", "stopping"].includes(appState.state);
+        loadButton.disabled = !modelEditable || busy;
+        unloadButton.disabled = !["loaded", "fatal"].includes(appState.state) || busy;
+        startButton.disabled = appState.state !== "loaded";
+        stopButton.disabled = !["starting", "running"].includes(appState.state) || busy;
+        laneSelect.disabled = !modelEditable || busy;
+        offlineModelSelect.disabled = !modelEditable || busy;
+        offlineModelPicker.disabled = !modelEditable || busy;
+        for (const element of laneInputConfig.querySelectorAll("select, button, input")) {
+          element.disabled = !laneInputsEditable || busy;
+        }
+        pathPickerUp.disabled = !pathPicker.parentPath || pathPicker.parentPath === pathPicker.currentPath;
+        pathPickerSelect.disabled = pathPicker.selection === "wav" && !pathPicker.pendingPath;
+      }
+
+      function renderStatus() {
+        serverState.textContent = `State: ${appState.state}`;
+        summaryMetrics.textContent = `Events: ${appState.eventCount}`;
+        updateControlAvailability();
+      }
+
+      function renderLaneEvent(event) {
+        const lane = ensureLane(event.stream_id);
+        const pinned = lane.results.scrollTop + lane.results.clientHeight >= lane.results.scrollHeight - 2;
+        const transcriptKey = laneKey(event.stream_id, event.sentence_id);
+        if (
+          event.status === "qwen_error"
+          && !lane.events.has(transcriptKey)
+          && event.sentence_id <= lane.prunedSentenceId
+        ) {
+          return false;
+        }
+        const storageKey = eventStorageKey(event);
+        lane.events.set(storageKey, event);
+        if (["partial", "pending", "final"].includes(event.status)) {
+          appState.revisions.set(transcriptKey, event.revision);
+        }
+        const sentenceKeys = [];
+        const seenSentenceKeys = new Set();
+        for (const laneEvent of lane.events.values()) {
+          const sentenceKey = laneKey(laneEvent.stream_id, laneEvent.sentence_id);
+          if (!seenSentenceKeys.has(sentenceKey)) {
+            seenSentenceKeys.add(sentenceKey);
+            sentenceKeys.push(sentenceKey);
+          }
+        }
+        while (sentenceKeys.length > MAX_DISPLAYED_SENTENCES_PER_LANE) {
+          const oldestKey = sentenceKeys.shift();
+          let prunedSentenceId = -1;
+          for (const [storedKey, laneEvent] of lane.events) {
+            if (laneKey(laneEvent.stream_id, laneEvent.sentence_id) !== oldestKey) continue;
+            prunedSentenceId = laneEvent.sentence_id;
+            lane.events.delete(storedKey);
+            lane.rows.get(storedKey)?.remove();
+            lane.rows.delete(storedKey);
+          }
+          lane.prunedSentenceId = Math.max(lane.prunedSentenceId, prunedSentenceId);
+          appState.revisions.delete(oldestKey);
+        }
+        lane.metrics.textContent = `Last update ${event.timestamp_ms} ms | sentences ${sentenceKeys.length}`;
+        const row = lane.rows.get(storageKey) || document.createElement("div");
+        if (!lane.rows.has(storageKey)) {
+          lane.rows.set(storageKey, row);
+          lane.results.appendChild(row);
+        }
+        row.className = `result ${event.status}`;
+        const isTranscriptEvent = ["partial", "pending", "final"].includes(event.status);
+        row.textContent = isTranscriptEvent ? event.text : (event.text || event.status);
+        if (pinned) lane.results.scrollTop = lane.results.scrollHeight;
+        return true;
+      }
+
+      function resetRecognitionView() {
+        appState.eventCount = 0;
+        appState.revisions = new Map();
+        appState.finishedLanes = new Set();
+        renderLaneGrid();
+        renderStatus();
+      }
+
+      /* ---------- 路径选择器（模拟 /api/path-browser） ---------- */
+
+      function openPathDialog({ selection, value, onSelect }) {
+        const editable = selection === "wav"
+          ? ["unloaded", "loaded"].includes(appState.state)
+          : appState.state === "unloaded";
+        if (!editable) return;
+        pathPicker.selection = selection;
+        pathPicker.pendingPath = null;
+        pathPicker.onSelect = onSelect;
+        const startPath = value && FAKE_FS[value.slice(0, value.lastIndexOf("/")) || "/"]
+          ? (FAKE_FS[value] !== undefined ? value : value.slice(0, value.lastIndexOf("/")) || "/")
+          : (selection === "wav" ? "/home/user/Music/wav16k" : "/data/models/asr");
+        loadPathEntries(startPath);
+        pathPickerDialog.showModal();
+      }
+
+      function loadPathEntries(path) {
+        const payload = fakeListDir(path, pathPicker.selection);
+        if (!payload) { showError(`Unable to browse path: ${path}`); return; }
+        pathPicker.currentPath = payload.current_path;
+        pathPicker.parentPath = payload.parent_path;
+        pathPicker.pendingPath = null;
+        pathPickerCurrentPath.textContent = payload.current_path;
+        pathPickerEntries.innerHTML = "";
+        for (const entry of payload.entries) {
+          const item = document.createElement("li");
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "path-picker-entry";
+          button.setAttribute("aria-selected", "false");
+          const icon = entry.kind === "directory" ? "[D]" : "[W]";
+          button.innerHTML = `<span class="path-picker-entry-icon" aria-hidden="true">${icon}</span><span></span>`;
+          button.lastElementChild.textContent = entry.name;
+          button.addEventListener("click", () => {
+            if (entry.kind === "directory") { loadPathEntries(entry.path); return; }
+            pathPicker.pendingPath = entry.path;
+            for (const candidate of pathPickerEntries.querySelectorAll("button")) {
+              candidate.setAttribute("aria-selected", String(candidate === button));
+            }
+            updateControlAvailability();
+          });
+          item.appendChild(button);
+          pathPickerEntries.appendChild(item);
+        }
+        updateControlAvailability();
+      }
+
+      function closePathDialog() {
+        if (pathPickerDialog.open) pathPickerDialog.close();
+        pathPicker.selection = null;
+        pathPicker.currentPath = null;
+        pathPicker.pendingPath = null;
+        pathPicker.parentPath = null;
+        pathPicker.onSelect = null;
+      }
+
+      pathPickerClose.addEventListener("click", closePathDialog);
+      pathPickerCancel.addEventListener("click", closePathDialog);
+      pathPickerUp.addEventListener("click", () => {
+        if (pathPicker.parentPath) loadPathEntries(pathPicker.parentPath);
+      });
+      pathPickerSelect.addEventListener("click", () => {
+        const selectedPath = pathPicker.selection === "directory" ? pathPicker.currentPath : pathPicker.pendingPath;
+        if (!selectedPath || !pathPicker.onSelect) return;
+        pathPicker.onSelect(selectedPath);
+        closePathDialog();
+      });
+      pathPickerDialog.addEventListener("cancel", (event) => {
+        event.preventDefault();
+        closePathDialog();
+      });
+
+      /* ---------- 配置控件 ---------- */
+
+      laneSelect.addEventListener("change", () => {
+        appState.lanes = Number(laneSelect.value);
+        ensureDraftLaneInputs();
+        renderLaneGrid();
+        renderLaneInputControls();
+      });
+      offlineModelSelect.addEventListener("change", () => {
+        appState.draft.offlineModelId = offlineModelSelect.value;
+        appState.draft.offlineModelDir = MODEL_DEFAULT_DIRS[offlineModelSelect.value];
+        offlineModelDirectory.textContent = appState.draft.offlineModelDir;
+      });
+      offlineModelPicker.addEventListener("click", () => {
+        openPathDialog({
+          selection: "directory",
+          value: appState.draft.offlineModelDir,
+          onSelect: (selectedPath) => {
+            appState.draft.offlineModelDir = selectedPath;
+            offlineModelDirectory.textContent = selectedPath;
+          },
+        });
+      });
+
+      /* ---------- 加载 / 卸载（模拟 /api/models/load 与 Zipformer 预热） ---------- */
+
+      loadButton.addEventListener("click", () => {
+        setOperation("Validating model files...");
+        const result = fakeValidateModel(appState.draft.offlineModelId, appState.draft.offlineModelDir);
+        if (!result.valid) {
+          showError(result.missing_files.join("\n"));
+          setOperation("");
+          return;
+        }
+        showError("");
+        appState.state = "loading";
+        setOperation("Loading models...");
+        renderStatus();
+        simTimeout(() => { setOperation("Warming up Zipformer..."); }, 1200);
+        simTimeout(() => {
+          appState.state = "loaded";
+          setOperation("Models loaded.");
+          renderStatus();
+        }, 3200);
+      });
+
+      unloadButton.addEventListener("click", () => {
+        appState.state = "unloading";
+        setOperation("Unloading models...");
+        renderStatus();
+        simTimeout(() => {
+          appState.state = "unloaded";
+          setOperation("Models unloaded.");
+          renderStatus();
+        }, 1000);
+      });
+
+      /* ---------- 识别（模拟 /ws 推送的 partial / final / lane_finished 事件） ---------- */
+
+      function emitEvent(event) {
+        if (!["starting", "running"].includes(appState.state)) return;
+        appState.eventCount += 1;
+        renderLaneEvent(event);
+        renderStatus();
+        if (event.status === "lane_finished") {
+          appState.finishedLanes.add(event.stream_id);
+          if (appState.finishedLanes.size === appState.lanes) {
+            appState.state = "loaded";
+            setOperation("Recognition completed.");
+            renderStatus();
+          }
+        }
+      }
+
+      function simulateLane(streamId, cycle = 0) {
+        const sentences = FAKE_SENTENCES[streamId % FAKE_SENTENCES.length];
+        const input = appState.draft.laneInputs[streamId];
+        let delay = 400 + streamId * 250;
+        sentences.forEach((sentence, sentenceId) => {
+          const emittedSentenceId = cycle * sentences.length + sentenceId;
+          const pieces = sentence.match(/.{1,4}/g) || [sentence];
+          let text = "";
+          pieces.forEach((piece, revision) => {
+            text += piece;
+            const partialText = text;
+            simTimeout(() => emitEvent({
+              stream_id: streamId, sentence_id: emittedSentenceId, revision,
+              status: "partial", text: partialText,
+              timestamp_ms: Math.round(delay),
+            }), delay);
+            delay += 260 + (streamId % 3) * 60;
+          });
+          simTimeout(() => emitEvent({
+            stream_id: streamId, sentence_id: emittedSentenceId, revision: pieces.length,
+            status: "final", text: sentence,
+            timestamp_ms: Math.round(delay),
+          }), delay);
+          delay += 700;
+        });
+        simTimeout(() => {
+          if (input.loop_audio && input.kind !== "microphone") {
+            if (appState.state === "running") simulateLane(streamId, cycle + 1);
+            return;
+          }
+          emitEvent({
+            stream_id: streamId, sentence_id: cycle * sentences.length + sentences.length, revision: 0,
+            status: "lane_finished", text: "lane_finished",
+            timestamp_ms: Math.round(delay),
+          });
+        }, delay);
+      }
+
+      startButton.addEventListener("click", () => {
+        appState.state = "starting";
+        setOperation("Starting recognition...");
+        resetRecognitionView();
+        simTimeout(() => {
+          if (appState.state !== "starting") return;
+          appState.state = "running";
+          setOperation("Recognition running.");
+          renderStatus();
+        }, 600);
+        for (let streamId = 0; streamId < appState.lanes; streamId += 1) simulateLane(streamId);
+      });
+
+      stopButton.addEventListener("click", () => {
+        clearSimulationTimers();
+        appState.state = "loaded";
+        setOperation("Recognition stopped.");
+        renderStatus();
+      });
+
+      /* =========================================================
+       * 教程步骤引擎
+       * ========================================================= */
+
+      const TUTORIAL_STEPS = [
+        {
+          title: "欢迎使用 Multi-Stream ASR",
+          target: null,
+          body: `
+            <p>本教程通过一个<strong>完全离线的界面模拟</strong>，帮助你学习 Multi-Stream ASR 的 Web 前端操作流程。左侧界面与真实服务页面（<code>http://&lt;device-ip&gt;:8000</code>）完全一致，但所有数据均为模拟，不会连接任何后端。</p>
+            <p>整体使用流程分为四步：</p>
+            <ul>
+              <li><strong>配置</strong>：选择通道数、离线模型和每路输入</li>
+              <li><strong>加载</strong>：Load Models（含 Zipformer 预热）</li>
+              <li><strong>识别</strong>：Start / Stop Recognition</li>
+              <li><strong>卸载</strong>：Unload Models 后可重新配置</li>
+            </ul>
+            <p>点击右下角「下一步」开始。</p>`,
+        },
+        {
+          title: "第 1 步：状态栏",
+          target: ".status-row",
+          body: `
+            <p>状态栏（高亮处）显示服务当前状态和累计事件数：</p>
+            <ul>
+              <li><code>unloaded</code>：未加载，可修改全部配置</li>
+              <li><code>loading</code> / <code>unloading</code>：过渡状态，控件锁定</li>
+              <li><code>loaded</code>：模型已加载，可开始识别；此时仅每路输入可改</li>
+              <li><code>starting</code> / <code>running</code> / <code>stopping</code>：识别过程状态</li>
+            </ul>
+            <p>右上角的连接指示显示与服务 WebSocket 的连接情况（真实页面中断线会每秒自动重连）。<code>Events</code> 计数是从 WebSocket 收到的识别事件总数。</p>`,
+        },
+        {
+          title: "第 2 步：选择通道数（Lanes）",
+          target: "#lane-count",
+          body: `
+            <p>服务支持 <strong>2 / 4 / 6 / 8</strong> 路并行识别。每一路（Lane）是一条独立的音频流，拥有自己的输入源和结果面板。</p>
+            <p>下方结果区的网格布局会随通道数自动调整（2 路一行、4 路 2×2、6 路 3×2、8 路 4×2）。</p>
+            <div class="try-it"><strong>试一试：</strong>把 Lanes 从 4 改为 8，观察下方结果网格和每路输入配置的变化。</div>
+            <p>注意：通道数只能在 <code>unloaded</code> 状态下修改。</p>`,
+        },
+        {
+          title: "第 3 步：选择离线模型",
+          target: "#offline-model",
+          body: `
+            <p>所有通道共享一个 Qwen 离线模型，有两种选择：</p>
+            <ul>
+              <li><code>qwen3-asr-0.6b-q40</code>：更快，默认目录 <code>models/asr/qwen3asr</code></li>
+              <li><code>qwen3-asr-1.7b-q4km</code>：更准，默认目录 <code>models/asr/qwen3asr-1.7b</code></li>
+            </ul>
+            <p>切换模型时，「Model directory」会自动填入该模型的默认目录。</p>
+            <div class="try-it"><strong>试一试：</strong>切换两个模型，观察右侧目录路径的变化。</div>`,
+        },
+        {
+          title: "第 4 步：模型目录与路径选择器",
+          target: "#offline-model-picker",
+          body: `
+            <p>如果模型放在非默认位置，点击目录旁的 <code>…</code> 按钮打开<strong>路径选择器</strong>，浏览的是<strong>服务主机</strong>上的文件系统（不是你本地电脑）。</p>
+            <ul>
+              <li><code>[D]</code> 表示目录，点击进入；<code>&uarr;</code> 返回上级</li>
+              <li>选目录时，点击 <code>Select</code> 即选中<strong>当前所在目录</strong></li>
+            </ul>
+            <div class="try-it"><strong>试一试：</strong>点击 <code>…</code>，进入 <code>qwen3asr</code> 目录后点 Select。也可以故意选 <code>empty-model-dir</code>，为下一步的错误演示做准备。</div>`,
+        },
+        {
+          title: "第 5 步：配置每路输入",
+          target: "#lane-input-config",
+          body: `
+            <p>每一路可独立选择输入源：</p>
+            <ul>
+              <li><strong>Default files</strong>：使用内置示例 WAV</li>
+              <li><strong>Local WAV</strong>：服务主机上的 WAV 文件，必须是 <strong>16 kHz 单声道 PCM</strong>；点 <code>…</code> 用路径选择器选中一个 <code>[W]</code> 文件再点 Select</li>
+              <li><strong>Microphone</strong>：通过 PortAudio 采集（16 kHz 单声道，100 ms 帧）；可指定设备或保持「Automatic assignment」自动分配</li>
+            </ul>
+            <div class="try-it"><strong>试一试：</strong>把 Lane 1 改为 Local WAV 并选择一个文件；把 Lane 2 改为 Microphone 看看设备列表。</div>
+            <p>每路输入在 <code>unloaded</code> 和 <code>loaded</code> 状态下都可以修改。</p>`,
+        },
+        {
+          title: "第 6 步：加载模型（Load Models）",
+          target: "#load-models",
+          body: `
+            <p>点击 <strong>Load Models</strong> 后，页面会先<strong>校验所有必需模型文件</strong>是否存在，服务端还会再校验一次。若有文件缺失，服务保持 <code>unloaded</code>，缺失路径显示在红色错误区。</p>
+            <p>校验通过后进入 <code>loading</code>；所有通道的 Zipformer 加载完成后，会并行预热，状态栏下方显示 <code>Warming up Zipformer...</code>，随后进入 <code>loaded</code>。</p>
+            <div class="try-it"><strong>试一试：</strong>先把模型目录改成 <code>empty-model-dir</code> 点 Load 看错误提示；再改回正确目录（重新选择模型即可恢复默认目录）点 Load，观察完整加载过程。</div>`,
+        },
+        {
+          title: "第 7 步：循环文件识别",
+          target: "#lane-input-config",
+          body: `
+            <p>循环文件识别：在 Default files 或 Local WAV 输入上勾选 Loop audio，开始识别后样例会持续重复，适合连续观察或压测。点击 Stop Recognition 结束循环。麦克风是实时输入，因此不会显示此选项。</p>
+            <div class="try-it"><strong>试一试：</strong>先加载模型；为 Lane 1 选择 Default files 或 Local WAV，勾选 Loop audio 后点击 Start Recognition；观察结果持续更新，再点击 Stop Recognition 结束循环。</div>`,
+        },
+        {
+          title: "第 8 步：开始识别（Start Recognition）",
+          target: "#start-recognition",
+          body: `
+            <p>状态变为 <code>loaded</code> 后，<strong>Start Recognition</strong> 按钮才可用。点击后会进入识别状态，并锁定每路输入控件，直到识别结束或停止。</p>
+            <div class="try-it"><strong>试一试：</strong>点击 Start Recognition，确认每路的输入类型、路径、麦克风和 Loop audio 控件均已锁定。</div>`,
+        },
+        {
+          title: "第 9 步：查看识别结果",
+          target: "#lane-grid",
+          body: `
+            <p>识别结果会按句子逐行增量更新：</p>
+            <ul>
+              <li><span style="color:#9ca3af">灰色文字</span>：<code>partial</code> 中间结果，会不断修正</li>
+              <li><strong>黑色文字</strong>：<code>final</code> 最终结果</li>
+              <li>每路顶部显示最近更新时间与句子数</li>
+            </ul>
+            <div class="try-it"><strong>试一试：</strong>点击 Start Recognition，观察各路灰色 partial 逐渐变成黑色 final 的过程。</div>
+            <p>每路保留最新的 100 个句子；超过上限时最早的句子会从页面移除。仅当没有文件通道启用 Loop audio 时，所有通道播完输入后会自动结束，显示 <code>Recognition completed.</code> 并回到 <code>loaded</code>，可再次 Start；启用 Loop audio 的文件识别会持续运行，直到点击 Stop Recognition。</p>`,
+        },
+        {
+          title: "第 10 步：停止与卸载",
+          target: "#stop-recognition",
+          body: `
+            <p><strong>Stop Recognition</strong> 可在识别中途手动停止；本地模拟会立即停止结果更新并直接回到 <code>loaded</code>，每路输入控件随即恢复可编辑。</p>
+            <p><strong>Unload Models</strong> 卸载全部模型（并停止应用启动的 <code>llama-server</code> 进程），状态回到 <code>unloaded</code>，全部配置重新可编辑。</p>
+            <p>每次网页触发的识别都会在服务主机的 <code>runs/web-*</code> 目录留下产物：</p>
+            <ul>
+              <li><code>results/lane&lt;N&gt;.txt</code>：各路最终文本</li>
+              <li><code>model_outputs/lane&lt;N&gt;.jsonl</code>：各路模型诊断信息</li>
+            </ul>`,
+        },
+        {
+          title: "完成！",
+          target: null,
+          body: `
+            <p>你已经了解了完整的操作流程：</p>
+            <p><strong>配置（Lanes / 模型 / 输入）&rarr; Load &rarr; Start &rarr; Stop / 自动完成 &rarr; Unload</strong></p>
+            <p>连接真实服务时，启动命令为：</p>
+            <p><code>python -m multi_stream_asr.main --host 0.0.0.0 --port 8000</code></p>
+            <p>然后浏览器打开 <code>http://&lt;device-ip&gt;:8000</code>，界面与本页完全一致。</p>
+            <p>可以点「重置演示」从头再练一遍，或直接在左侧界面自由操作。更多细节参见项目 <code>README.md</code>。</p>`,
+        },
+      ];
+
+      const tutorialBody = document.getElementById("tutorial-body");
+      const stepIndicator = document.getElementById("step-indicator");
+      const prevButton = document.getElementById("tutorial-prev");
+      const nextButton = document.getElementById("tutorial-next");
+      const resetButton = document.getElementById("tutorial-reset");
+      let currentStep = 0;
+      let highlighted = null;
+
+      function clearHighlight() {
+        if (highlighted) highlighted.classList.remove("tutorial-highlight");
+        highlighted = null;
+      }
+
+      function renderTutorialStep() {
+        const step = TUTORIAL_STEPS[currentStep];
+        tutorialBody.innerHTML = `<h2>${step.title}</h2>${step.body}`;
+        tutorialBody.scrollTop = 0;
+        stepIndicator.textContent = `第 ${currentStep + 1} / ${TUTORIAL_STEPS.length} 步`;
+        prevButton.disabled = currentStep === 0;
+        nextButton.disabled = currentStep === TUTORIAL_STEPS.length - 1;
+        clearHighlight();
+        if (step.target) {
+          const element = document.querySelector(step.target);
+          if (element) {
+            element.classList.add("tutorial-highlight");
+            highlighted = element;
+            element.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          }
+        }
+      }
+
+      prevButton.addEventListener("click", () => {
+        if (currentStep > 0) { currentStep -= 1; renderTutorialStep(); }
+      });
+      nextButton.addEventListener("click", () => {
+        if (currentStep < TUTORIAL_STEPS.length - 1) { currentStep += 1; renderTutorialStep(); }
+      });
+      resetButton.addEventListener("click", () => {
+        clearSimulationTimers();
+        closePathDialog();
+        appState.state = "unloaded";
+        appState.lanes = 4;
+        appState.eventCount = 0;
+        appState.finishedLanes = new Set();
+        appState.draft.offlineModelId = "qwen3-asr-0.6b-q40";
+        appState.draft.offlineModelDir = MODEL_DEFAULT_DIRS["qwen3-asr-0.6b-q40"];
+        appState.draft.laneInputs = [];
+        laneSelect.value = "4";
+        offlineModelSelect.value = appState.draft.offlineModelId;
+        offlineModelDirectory.textContent = appState.draft.offlineModelDir;
+        setOperation("");
+        showError("");
+        renderLaneGrid();
+        renderLaneInputControls();
+        renderStatus();
+        currentStep = 0;
+        renderTutorialStep();
+      });
+
+      /* ---------- 初始化 ---------- */
+
+      offlineModelDirectory.textContent = appState.draft.offlineModelDir;
+      renderLaneGrid();
+      renderLaneInputControls();
+      renderStatus();
+      renderTutorialStep();
+    </script>
+  </body>
+</html>

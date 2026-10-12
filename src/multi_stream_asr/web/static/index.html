@@ -1,0 +1,1165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Multi-Stream ASR</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, "Segoe UI", Arial, sans-serif;
+        --accent: #b0e237;
+        --accent-soft: #edffdc;
+        --accent-deep: #5d7d00;
+        --canvas: #f5f6f2;
+        --surface: #ffffff;
+        --ink: #171b16;
+        --muted: #697065;
+        --border: #dce1d7;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--canvas);
+        color: var(--ink);
+      }
+
+      .app-shell {
+        height: 100dvh;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .toolbar,
+      .status-row,
+      .configuration-panel {
+        flex: none;
+        padding: 12px 20px;
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .toolbar,
+      .status-row,
+      .configuration-panel,
+      .control-group,
+      .lane-input-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .toolbar {
+        flex-wrap: wrap;
+        padding-block: 14px;
+        color: #ffffff;
+        background: #1d2519;
+        border-bottom: 0;
+        box-shadow: 0 3px 18px rgb(23 27 22 / 14%);
+      }
+      .brand { display: inline-flex; align-items: center; gap: 9px; margin-right: 8px; }
+      .brand img { display: block; width: 27px; height: 34px; }
+      .brand-copy { display: grid; line-height: 1.05; }
+      .brand-copy strong { font-size: 17px; letter-spacing: -0.02em; }
+      .brand-copy small { margin-top: 4px; color: #d8e0d0; font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+      .status-row { justify-content: space-between; }
+      .configuration-panel { align-items: flex-start; flex-wrap: wrap; }
+      .control-group { flex-wrap: wrap; }
+
+      #server-state, #summary-metrics { flex: none; white-space: nowrap; }
+      #operation-status {
+        flex: 1 1 auto;
+        min-width: 0;
+        margin: 0;
+        color: var(--muted);
+        text-align: center;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      label { font-size: 14px; color: var(--muted); }
+      input, select, button { font: inherit; min-height: 34px; }
+      input, select { border: 1px solid var(--border); border-radius: 5px; background: var(--surface); padding: 0 8px; color: var(--ink); }
+      button { border: 1px solid var(--border); border-radius: 5px; background: var(--surface); padding: 0 12px; color: var(--ink); cursor: pointer; transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease; }
+      button:hover:not(:disabled) { border-color: #aeb8a5; background: #f7f9f4; }
+      button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid rgb(176 226 55 / 48%); outline-offset: 2px; }
+      .toolbar button { color: #f8fbf4; background: rgb(255 255 255 / 10%); border-color: rgb(255 255 255 / 23%); }
+      .toolbar button:hover:not(:disabled) { background: rgb(255 255 255 / 18%); border-color: rgb(255 255 255 / 42%); }
+      .toolbar #load-models, .toolbar #start-recognition { color: #1d2519; background: var(--accent); border-color: var(--accent); font-weight: 700; }
+      .toolbar #load-models:hover:not(:disabled), .toolbar #start-recognition:hover:not(:disabled) { background: #c6eb61; border-color: #c6eb61; }
+      button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
+      .path-output {
+        min-width: min(460px, 72vw);
+        min-height: 34px;
+        display: inline-flex;
+        align-items: center;
+        padding: 0 8px;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        background: var(--surface);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .lane-input-row .path-output { min-width: 0; flex: 1; }
+      .icon-button { width: 34px; min-width: 34px; padding: 0; font-size: 18px; }
+      .metrics { font-size: 14px; color: var(--muted); }
+      .toolbar .metrics { color: #d8e0d0; }
+      .hidden { display: none !important; }
+
+      #path-picker-dialog {
+        width: min(680px, calc(100vw - 32px));
+        max-width: 680px;
+        padding: 0;
+        color: var(--ink);
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        box-shadow: 0 20px 55px rgb(23 27 22 / 26%);
+      }
+
+      #path-picker-dialog::backdrop { background: rgb(23 27 22 / 48%); }
+      .path-picker-header,
+      .path-picker-toolbar,
+      .path-picker-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px;
+      }
+      .path-picker-header { justify-content: space-between; border-bottom: 1px solid var(--border); }
+      .path-picker-header h2 { margin: 0; font-size: 18px; }
+      .path-picker-toolbar { border-bottom: 1px solid var(--border); background: #fafcf7; }
+      #path-picker-current-path { min-width: 0; flex: 1; }
+      #path-picker-entries {
+        height: 320px;
+        margin: 0;
+        padding: 0;
+        overflow-y: auto;
+        list-style: none;
+      }
+      .path-picker-entry {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        text-align: left;
+        border: 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .path-picker-entry[aria-selected="true"] { background: var(--accent-soft); }
+      .path-picker-entry-icon { width: 18px; text-align: center; }
+      .path-picker-actions { justify-content: flex-end; border-top: 1px solid var(--border); }
+
+      #configuration-error {
+        margin: 0;
+        padding: 8px 20px;
+        white-space: pre-wrap;
+        color: #991b1b;
+        background: #fff4f2;
+        border-bottom: 1px solid #fecaca;
+      }
+
+      .lane-input-config {
+        width: 100%;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+        gap: 8px;
+      }
+
+      .lane-input-row {
+        min-width: 0;
+        padding: 8px;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        background: #fafcf7;
+      }
+      .lane-input-row { flex-wrap: nowrap; }
+      .lane-input-row > strong { flex: 0 0 auto; white-space: nowrap; }
+      .lane-input-row label { display: flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
+      .input-kind { width: 128px; min-width: 0; }
+      .microphone-device {
+        flex: 1 1 0;
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .lane-grid {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow: hidden;
+        display: grid;
+        gap: 12px;
+        padding: 12px 20px 20px;
+      }
+
+      .lane-grid[data-lanes="2"] {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-rows: 1fr;
+      }
+
+      .lane-grid[data-lanes="4"] {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-rows: repeat(2, 1fr);
+      }
+
+      .lane-grid[data-lanes="6"] {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-rows: repeat(2, 1fr);
+      }
+
+      .lane-grid[data-lanes="8"] {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-rows: repeat(2, 1fr);
+      }
+
+      .lane {
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto auto minmax(0, 1fr);
+        position: relative;
+        overflow: hidden;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        box-shadow: 0 4px 16px rgb(23 27 22 / 6%);
+      }
+
+      .lane::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--accent); }
+
+      .lane header,
+      .lane .lane-metrics { padding: 10px 12px; border-bottom: 1px solid #e5e7eb; }
+      .lane header { padding-left: 15px; font-weight: 700; }
+      .lane .lane-metrics { font-size: 13px; color: var(--muted); }
+
+      .lane .results {
+        min-height: 0;
+        overflow-y: auto;
+        padding: 12px;
+        display: grid;
+        gap: 8px;
+        align-content: start;
+      }
+
+      .result { padding: 7px 9px; border-radius: 5px; background: #fafcf7; line-height: 1.45; }
+      .result.partial, .result.pending { color: var(--muted); }
+      .result.final { color: var(--ink); }
+      .result.fatal_error { color: #b91c1c; }
+      .result.qwen_error {
+        color: #9a3412;
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+
+      @media (max-width: 800px) {
+        .app-shell { min-height: 100dvh; height: auto; overflow: auto; }
+        .toolbar { align-items: flex-start; }
+        .brand { width: 100%; }
+        .lane-grid { min-height: 70vh; overflow: visible; }
+        .lane-grid[data-lanes] { grid-template-columns: 1fr; grid-template-rows: none; }
+        .lane { min-height: 240px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app-shell">
+      <div class="toolbar">
+        <div class="brand">
+          <img src="/spacemit-logo.svg" alt="Spacemit" width="27" height="34" />
+          <span class="brand-copy"><strong>Spacemit</strong><small>Multi-Stream ASR</small></span>
+        </div>
+        <div class="control-group">
+          <button id="load-models" type="button">Load Models</button>
+          <button id="unload-models" type="button">Unload Models</button>
+          <button id="start-recognition" type="button">Start Recognition</button>
+          <button id="stop-recognition" type="button">Stop Recognition</button>
+        </div>
+        <span id="connection-state" class="metrics">Disconnected</span>
+      </div>
+
+      <div class="status-row">
+        <div id="server-state">State: unknown</div>
+        <p id="operation-status" role="status"></p>
+        <div id="summary-metrics" class="metrics">Events: 0</div>
+      </div>
+
+      <section id="configuration-panel" class="configuration-panel">
+        <div class="control-group">
+          <label for="lane-count">Lanes</label>
+          <select id="lane-count">
+            <option value="2">2</option>
+            <option value="4" selected>4</option>
+            <option value="6">6</option>
+            <option value="8">8</option>
+          </select>
+          <label for="offline-model">Offline model</label>
+          <select id="offline-model">
+            <option value="qwen3-asr-0.6b-q40">Qwen3-ASR 0.6B q40</option>
+            <option value="qwen3-asr-1.7b-q4km">Qwen3-ASR 1.7B q4km</option>
+          </select>
+          <label for="offline-model-dir">Model directory</label>
+          <output id="offline-model-dir" class="path-output"></output>
+          <button id="offline-model-picker" class="icon-button" type="button" aria-label="Choose model directory" title="Choose model directory">&hellip;</button>
+        </div>
+        <div id="lane-input-config" class="lane-input-config"></div>
+      </section>
+
+      <div>
+        <pre id="configuration-error" class="hidden" role="alert"></pre>
+      </div>
+
+      <main id="lane-grid" class="lane-grid" data-lanes="4"></main>
+    </div>
+
+    <dialog id="path-picker-dialog" aria-labelledby="path-picker-title">
+      <div class="path-picker-header">
+        <h2 id="path-picker-title">Choose path</h2>
+        <button id="path-picker-close" class="icon-button" type="button" aria-label="Close path picker" title="Close">&times;</button>
+      </div>
+      <div class="path-picker-toolbar">
+        <button id="path-picker-up" class="icon-button" type="button" aria-label="Up one directory" title="Up">&uarr;</button>
+        <output id="path-picker-current-path" class="path-output"></output>
+      </div>
+      <ul id="path-picker-entries" aria-label="Path entries"></ul>
+      <div class="path-picker-actions">
+        <button id="path-picker-cancel" type="button">Cancel</button>
+        <button id="path-picker-select" type="button">Select</button>
+      </div>
+    </dialog>
+
+    <script>
+      const appState = {
+        lanes: 4,
+        state: "unknown",
+        socket: null,
+        eventCount: 0,
+        revisions: new Map(),
+        pendingPartials: new Map(),
+        pendingNonPartials: [],
+        eventFlushScheduled: false,
+        finishedLanes: new Set(),
+        laneEntries: new Map(),
+        microphoneDeviceRequestGeneration: 0,
+        microphoneDevices: [],
+        microphoneDeviceRefreshPending: false,
+        microphoneDeviceErrors: new Map(),
+        configurationErrorMessage: "",
+        laneInputSubmissionPending: false,
+        offlineModelDirectories: {},
+        draft: {
+          offlineModelId: "qwen3-asr-0.6b-q40",
+          offlineModelDir: "",
+          laneInputs: [],
+        },
+      };
+      const MAX_DISPLAYED_SENTENCES_PER_LANE = 100;
+
+      const laneSelect = document.getElementById("lane-count");
+      const offlineModelSelect = document.getElementById("offline-model");
+      const offlineModelDirectory = document.getElementById("offline-model-dir");
+      const offlineModelPicker = document.getElementById("offline-model-picker");
+      const configurationPanel = document.getElementById("configuration-panel");
+      const laneInputConfig = document.getElementById("lane-input-config");
+      const serverState = document.getElementById("server-state");
+      const summaryMetrics = document.getElementById("summary-metrics");
+      const laneGrid = document.getElementById("lane-grid");
+      const connectionState = document.getElementById("connection-state");
+      const operationStatus = document.getElementById("operation-status");
+      const configurationError = document.getElementById("configuration-error");
+      const loadButton = document.getElementById("load-models");
+      const unloadButton = document.getElementById("unload-models");
+      const startButton = document.getElementById("start-recognition");
+      const stopButton = document.getElementById("stop-recognition");
+      const pathPickerDialog = document.getElementById("path-picker-dialog");
+      const pathPickerClose = document.getElementById("path-picker-close");
+      const pathPickerUp = document.getElementById("path-picker-up");
+      const pathPickerCurrentPath = document.getElementById("path-picker-current-path");
+      const pathPickerEntries = document.getElementById("path-picker-entries");
+      const pathPickerCancel = document.getElementById("path-picker-cancel");
+      const pathPickerSelect = document.getElementById("path-picker-select");
+      const pathPicker = {
+        selection: null,
+        currentPath: null,
+        pendingPath: null,
+        parentPath: null,
+        onSelect: null,
+      };
+      let loadPhaseTimer = null;
+      let completionRefreshTimer = null;
+
+      function laneKey(streamId, sentenceId) {
+        return `${streamId}:${sentenceId}`;
+      }
+
+      function eventStorageKey(event) {
+        const streamId = event.stream_id;
+        const sentenceId = event.sentence_id;
+        const isTranscriptEvent = ["partial", "pending", "final"].includes(event.status);
+        if (!isTranscriptEvent) {
+          return `${streamId}:${sentenceId}:${event.status}`;
+        }
+        return laneKey(streamId, sentenceId);
+      }
+
+      function defaultLaneInput() {
+        return {
+          kind: "default_files",
+          local_wav_path: null,
+          microphone_device: null,
+          microphone_device_id: null,
+          loop_audio: false,
+        };
+      }
+
+      function ensureDraftLaneInputs() {
+        const previousLaneCount = appState.draft.laneInputs.length;
+        while (appState.draft.laneInputs.length < appState.lanes) {
+          appState.draft.laneInputs.push(defaultLaneInput());
+        }
+        appState.draft.laneInputs.length = appState.lanes;
+        if (appState.lanes < previousLaneCount) {
+          for (const streamId of appState.microphoneDeviceErrors.keys()) {
+            if (streamId >= appState.lanes) appState.microphoneDeviceErrors.delete(streamId);
+          }
+          renderConfigurationErrors();
+        }
+      }
+
+      function showError(message) {
+        appState.configurationErrorMessage = message;
+        renderConfigurationErrors();
+      }
+
+      function setMicrophoneDeviceError(streamId, message) {
+        if (message) {
+          appState.microphoneDeviceErrors.set(streamId, `Lane ${streamId + 1}: ${message}`);
+        } else {
+          appState.microphoneDeviceErrors.delete(streamId);
+        }
+        renderConfigurationErrors();
+        updateControlAvailability();
+      }
+
+      function renderConfigurationErrors() {
+        const messages = [
+          appState.configurationErrorMessage,
+          ...Array.from(appState.microphoneDeviceErrors.entries())
+            .sort(([left], [right]) => left - right)
+            .map(([, message]) => message),
+        ].filter(Boolean);
+        configurationError.textContent = messages.join("\n");
+        configurationError.classList.toggle("hidden", messages.length === 0);
+      }
+
+      function setOperation(message) {
+        operationStatus.textContent = message;
+      }
+
+      function ensureLane(streamId) {
+        if (appState.laneEntries.has(streamId)) return appState.laneEntries.get(streamId);
+        const section = document.createElement("section");
+        section.className = "lane";
+        section.innerHTML = `<header>Lane ${streamId + 1}</header><div class="lane-metrics">No events yet.</div><div class="results"></div>`;
+        laneGrid.appendChild(section);
+        const lane = {
+          root: section,
+          metrics: section.querySelector(".lane-metrics"),
+          results: section.querySelector(".results"),
+          events: new Map(),
+          prunedSentenceId: -1,
+          rows: new Map(),
+        };
+        appState.laneEntries.set(streamId, lane);
+        return lane;
+      }
+
+      function renderLaneGrid() {
+        laneGrid.dataset.lanes = String(appState.lanes);
+        laneGrid.innerHTML = "";
+        appState.laneEntries.clear();
+        for (let streamId = 0; streamId < appState.lanes; streamId += 1) ensureLane(streamId);
+      }
+
+      function renderLaneInputControls() {
+        ensureDraftLaneInputs();
+        laneInputConfig.innerHTML = "";
+        let hasMicrophoneInput = false;
+        for (let streamId = 0; streamId < appState.lanes; streamId += 1) {
+          const input = appState.draft.laneInputs[streamId];
+          const row = document.createElement("div");
+          row.className = "lane-input-row";
+          row.innerHTML = `<strong>Lane ${streamId + 1}</strong><label>Input <select class="input-kind"><option value="default_files">Default files</option><option value="local_wav">Local WAV</option><option value="microphone">Microphone</option></select></label><output class="local-wav-path path-output hidden"></output><button class="local-wav-picker icon-button hidden" type="button" aria-label="Choose local WAV file" title="Choose local WAV file">&hellip;</button><select class="microphone-device hidden"></select>`;
+          const kind = row.querySelector(".input-kind");
+          const path = row.querySelector(".local-wav-path");
+          const pathPicker = row.querySelector(".local-wav-picker");
+          const device = row.querySelector(".microphone-device");
+          const loop = document.createElement("label");
+          loop.className = "loop-audio hidden";
+          loop.innerHTML = '<input type="checkbox"> Loop audio';
+          row.appendChild(loop);
+          const loopCheckbox = loop.querySelector("input");
+          loopCheckbox.checked = input.loop_audio === true;
+          kind.value = input.kind;
+          path.textContent = input.local_wav_path || "";
+          kind.addEventListener("change", async () => {
+            const current = appState.draft.laneInputs[streamId];
+            current.kind = kind.value;
+            if (current.kind !== "local_wav") current.local_wav_path = null;
+            if (current.kind !== "microphone") {
+              current.microphone_device = null;
+              current.microphone_device_id = null;
+            }
+            if (current.kind === "microphone") current.loop_audio = false;
+            updateLaneInputVisibility(row, current);
+            if (current.kind === "microphone") {
+              requestMicrophoneDevices();
+            } else {
+              setMicrophoneDeviceError(streamId, "");
+              if (appState.draft.laneInputs.some((input) => input.kind === "microphone")) {
+                requestMicrophoneDevices();
+              } else {
+                nextMicrophoneDeviceRequestGeneration();
+                appState.microphoneDeviceRefreshPending = false;
+                updateControlAvailability();
+              }
+            }
+          });
+          pathPicker.addEventListener("click", () => {
+            const current = appState.draft.laneInputs[streamId];
+            openPathDialog({
+              selection: "wav",
+              value: current.local_wav_path,
+              onSelect: (selectedPath) => {
+                const current = appState.draft.laneInputs[streamId];
+                current.local_wav_path = selectedPath;
+                path.textContent = selectedPath;
+              },
+            }).catch((error) => showError(error.message));
+          });
+          device.addEventListener("change", () => {
+            const current = appState.draft.laneInputs[streamId];
+            const selectedId = device.value || null;
+            const selectedOption = device.selectedOptions[0];
+            current.microphone_device_id = selectedId;
+            current.microphone_device = selectedId && selectedOption?.dataset.index
+              ? Number(selectedOption.dataset.index)
+              : null;
+            setMicrophoneDeviceError(streamId, "");
+          });
+          loopCheckbox.addEventListener("change", () => {
+            appState.draft.laneInputs[streamId].loop_audio = loopCheckbox.checked;
+          });
+          laneInputConfig.appendChild(row);
+          updateLaneInputVisibility(row, input);
+          if (input.kind === "microphone") {
+            hasMicrophoneInput = true;
+          }
+        }
+        if (hasMicrophoneInput) {
+          requestMicrophoneDevices();
+        } else {
+          nextMicrophoneDeviceRequestGeneration();
+          appState.microphoneDeviceRefreshPending = false;
+        }
+        updateControlAvailability();
+      }
+
+      function updateLaneInputVisibility(row, input) {
+        row.querySelector(".local-wav-path").classList.toggle("hidden", input.kind !== "local_wav");
+        row.querySelector(".local-wav-picker").classList.toggle("hidden", input.kind !== "local_wav");
+        row.querySelector(".microphone-device").classList.toggle("hidden", input.kind !== "microphone");
+        row.querySelector(".loop-audio").classList.toggle("hidden", input.kind === "microphone");
+        row.querySelector(".loop-audio input").checked = input.loop_audio === true;
+      }
+
+      async function loadMicrophoneDevices() {
+        const response = await fetch("/api/audio-devices", { cache: "no-store" });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || "Unable to list microphone devices");
+        return payload.devices;
+      }
+
+      function populateMicrophoneDevices(select, input, devices) {
+        select.innerHTML = '<option value="">Automatic assignment</option>';
+        for (const device of devices) {
+          const option = document.createElement("option");
+          option.value = device.id;
+          option.dataset.index = String(device.index);
+          option.textContent = `${device.index}: ${device.name}`;
+          select.appendChild(option);
+        }
+        if (!input.microphone_device_id && input.microphone_device !== null) {
+          const legacyDevice = devices.find(
+            (device) => device.index === input.microphone_device,
+          );
+          if (legacyDevice) input.microphone_device_id = legacyDevice.id;
+        }
+        const selectedId = input.microphone_device_id;
+        const selectedDevice = devices.find((device) => device.id === selectedId);
+        if (selectedId && !selectedDevice) {
+          const unavailable = document.createElement("option");
+          unavailable.value = selectedId;
+          unavailable.textContent = `Unavailable: ${selectedId}`;
+          select.appendChild(unavailable);
+          select.value = selectedId;
+          return false;
+        }
+        select.value = selectedId || "";
+        input.microphone_device = selectedDevice ? selectedDevice.index : null;
+        return true;
+      }
+
+      function refreshAllMicrophoneDeviceControls(devices) {
+        appState.microphoneDevices = devices;
+        const rows = laneInputConfig.querySelectorAll(".lane-input-row");
+        for (let streamId = 0; streamId < appState.lanes; streamId += 1) {
+          const current = appState.draft.laneInputs[streamId];
+          if (current.kind !== "microphone") continue;
+          const select = rows[streamId].querySelector(".microphone-device");
+          const available = populateMicrophoneDevices(select, current, devices);
+          setMicrophoneDeviceError(
+            streamId,
+            available ? "" : "Selected microphone is unavailable",
+          );
+        }
+      }
+
+      function nextMicrophoneDeviceRequestGeneration() {
+        appState.microphoneDeviceRequestGeneration += 1;
+        return appState.microphoneDeviceRequestGeneration;
+      }
+
+      function isCurrentMicrophoneDeviceRequest(generation) {
+        return appState.microphoneDeviceRequestGeneration === generation;
+      }
+
+      function requestMicrophoneDevices() {
+        const generation = nextMicrophoneDeviceRequestGeneration();
+        appState.microphoneDeviceRefreshPending = true;
+        updateControlAvailability();
+        loadMicrophoneDevices()
+          .then((devices) => {
+            if (!isCurrentMicrophoneDeviceRequest(generation)) return;
+            refreshAllMicrophoneDeviceControls(devices);
+          })
+          .catch((error) => {
+            if (!isCurrentMicrophoneDeviceRequest(generation)) return;
+            for (let streamId = 0; streamId < appState.lanes; streamId += 1) {
+              if (appState.draft.laneInputs[streamId].kind === "microphone") {
+                setMicrophoneDeviceError(streamId, error.message);
+              }
+            }
+          })
+          .finally(() => {
+            if (!isCurrentMicrophoneDeviceRequest(generation)) return;
+            appState.microphoneDeviceRefreshPending = false;
+            updateControlAvailability();
+          });
+      }
+
+      function updateControlAvailability() {
+        const modelBusy = ["loading", "unloading"].includes(appState.state);
+        const recognitionActive = ["starting", "running", "stopping"].includes(appState.state);
+        const modelEditable = appState.state === "unloaded" && !modelBusy;
+        const laneInputsEditable = !recognitionActive && !appState.laneInputSubmissionPending;
+        loadButton.disabled = !modelEditable;
+        unloadButton.disabled = !["loaded", "fatal"].includes(appState.state) || modelBusy || recognitionActive || appState.laneInputSubmissionPending;
+        startButton.disabled = appState.state !== "loaded"
+          || appState.laneInputSubmissionPending
+          || appState.microphoneDeviceRefreshPending
+          || appState.microphoneDeviceErrors.size > 0;
+        stopButton.disabled = !["starting", "running"].includes(appState.state);
+        laneSelect.disabled = !modelEditable;
+        offlineModelSelect.disabled = !modelEditable;
+        offlineModelPicker.disabled = !modelEditable;
+        for (const element of laneInputConfig.querySelectorAll("select, button")) {
+          element.disabled = !laneInputsEditable;
+        }
+        const pathPickerEditable = pathPicker.selection === "wav"
+          ? laneInputsEditable
+          : modelEditable;
+        for (const element of pathPickerEntries.querySelectorAll("button")) {
+          element.disabled = !pathPickerEditable;
+        }
+        pathPickerClose.disabled = !pathPickerEditable;
+        pathPickerCancel.disabled = !pathPickerEditable;
+        pathPickerUp.disabled = !pathPickerEditable || !pathPicker.parentPath
+          || pathPicker.parentPath === pathPicker.currentPath;
+        pathPickerSelect.disabled = !pathPickerEditable || (
+          pathPicker.selection === "wav" && !pathPicker.pendingPath
+        );
+      }
+
+      function renderStatus() {
+        serverState.textContent = `State: ${appState.state}`;
+        summaryMetrics.textContent = `Events: ${appState.eventCount}`;
+        updateControlAvailability();
+      }
+
+      function scrollResultsIfPinnedToBottom(results, pinned) {
+        if (pinned) results.scrollTop = results.scrollHeight;
+      }
+
+      function sentenceGroupKeys(lane) {
+        const keys = [];
+        const seen = new Set();
+        for (const laneEvent of lane.events.values()) {
+          const key = laneKey(laneEvent.stream_id, laneEvent.sentence_id);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          keys.push(key);
+        }
+        return keys;
+      }
+
+      function renderLaneEvent(event) {
+        const lane = ensureLane(event.stream_id);
+        const pinned = lane.results.scrollTop + lane.results.clientHeight >= lane.results.scrollHeight - 2;
+        const transcriptKey = laneKey(event.stream_id, event.sentence_id);
+        if (
+          event.status === "qwen_error"
+          && !lane.events.has(transcriptKey)
+          && event.sentence_id <= lane.prunedSentenceId
+        ) {
+          return false;
+        }
+        const storageKey = eventStorageKey(event);
+        lane.events.set(storageKey, event);
+        const sentenceKeys = sentenceGroupKeys(lane);
+        while (sentenceKeys.length > MAX_DISPLAYED_SENTENCES_PER_LANE) {
+          const oldestKey = sentenceKeys.shift();
+          let prunedSentenceId = -1;
+          for (const [storageKey, laneEvent] of lane.events) {
+            if (laneKey(laneEvent.stream_id, laneEvent.sentence_id) !== oldestKey) continue;
+            prunedSentenceId = laneEvent.sentence_id;
+            lane.events.delete(storageKey);
+            lane.rows.get(storageKey)?.remove();
+            lane.rows.delete(storageKey);
+          }
+          lane.prunedSentenceId = Math.max(lane.prunedSentenceId, prunedSentenceId);
+          appState.revisions.delete(oldestKey);
+        }
+        lane.metrics.textContent = `Last update ${event.timestamp_ms} ms | sentences ${sentenceKeys.length}`;
+        const row = lane.rows.get(storageKey) || document.createElement("div");
+        if (!lane.rows.has(storageKey)) {
+          lane.rows.set(storageKey, row);
+          lane.results.appendChild(row);
+        }
+        row.className = `result ${event.status}`;
+        const isTranscriptEvent = ["partial", "pending", "final"].includes(event.status);
+        row.textContent = isTranscriptEvent ? event.text : (event.text || event.status);
+        scrollResultsIfPinnedToBottom(lane.results, pinned);
+        return true;
+      }
+
+      function resetRecognitionView() {
+        appState.eventCount = 0;
+        appState.revisions = new Map();
+        appState.pendingPartials.clear();
+        appState.pendingNonPartials = [];
+        appState.finishedLanes = new Set();
+        renderLaneGrid();
+        renderStatus();
+      }
+
+      function snapshotRecognitionView() {
+        return {
+          eventCount: appState.eventCount,
+          revisions: new Map(appState.revisions),
+          eventsByLane: new Map(Array.from(appState.laneEntries.entries()).map(([streamId, lane]) => [streamId, {
+            events: Array.from(lane.events.values()),
+            prunedSentenceId: lane.prunedSentenceId,
+          }])),
+        };
+      }
+
+      function restoreRecognitionView(snapshot) {
+        appState.eventCount = snapshot.eventCount;
+        appState.revisions = new Map(snapshot.revisions);
+        renderLaneGrid();
+        for (const [streamId, laneSnapshot] of snapshot.eventsByLane) {
+          const lane = ensureLane(streamId);
+          lane.prunedSentenceId = laneSnapshot.prunedSentenceId;
+          for (const event of laneSnapshot.events) renderLaneEvent(event);
+        }
+        renderStatus();
+      }
+
+      function loadDraftFromPayload(payload) {
+        const laneCountChanged = payload.lanes && payload.lanes !== appState.lanes;
+        if (payload.lanes) appState.lanes = payload.lanes;
+        laneSelect.value = String(payload.lanes);
+        if (payload.offline_model_dirs) {
+          appState.offlineModelDirectories = payload.offline_model_dirs;
+        }
+        appState.draft.offlineModelId = payload.offline_model_id || appState.draft.offlineModelId;
+        appState.draft.offlineModelDir = payload.offline_model_dir || appState.draft.offlineModelDir;
+        appState.draft.laneInputs = payload.lane_inputs || appState.draft.laneInputs;
+        for (const input of appState.draft.laneInputs) {
+          if (typeof input.loop_audio !== "boolean") input.loop_audio = false;
+        }
+        offlineModelSelect.value = appState.draft.offlineModelId;
+        offlineModelDirectory.textContent = appState.draft.offlineModelDir;
+        return laneCountChanged;
+      }
+
+      async function openPathDialog({ selection, value, onSelect }) {
+        const editable = selection === "wav"
+          ? !["starting", "running", "stopping"].includes(appState.state)
+          : appState.state === "unloaded";
+        if (!editable) return;
+        pathPicker.selection = selection;
+        pathPicker.currentPath = null;
+        pathPicker.pendingPath = null;
+        pathPicker.parentPath = null;
+        pathPicker.onSelect = onSelect;
+        await loadPathEntries(value || null);
+        pathPickerDialog.showModal();
+      }
+
+      async function loadPathEntries(path) {
+        const query = new URLSearchParams({ selection: pathPicker.selection });
+        if (path) query.set("path", path);
+        const response = await fetch(`/api/path-browser?${query}`);
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || "Unable to browse path");
+        pathPicker.currentPath = payload.current_path;
+        pathPicker.parentPath = payload.parent_path;
+        pathPicker.pendingPath = null;
+        renderPathEntries(payload);
+      }
+
+      function renderPathEntries(payload) {
+        pathPickerCurrentPath.textContent = payload.current_path;
+        pathPickerUp.disabled = !payload.parent_path || payload.parent_path === payload.current_path;
+        pathPickerEntries.innerHTML = "";
+        for (const entry of payload.entries) {
+          const item = document.createElement("li");
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "path-picker-entry";
+          button.setAttribute("aria-selected", "false");
+          const icon = entry.kind === "directory" ? "[D]" : "[W]";
+          button.innerHTML = `<span class="path-picker-entry-icon" aria-hidden="true">${icon}</span><span></span>`;
+          button.lastElementChild.textContent = entry.name;
+          button.addEventListener("click", () => {
+            if (entry.kind === "directory") {
+              loadPathEntries(entry.path).catch((error) => showError(error.message));
+              return;
+            }
+            pathPicker.pendingPath = entry.path;
+            for (const candidate of pathPickerEntries.querySelectorAll("button")) {
+              candidate.setAttribute("aria-selected", String(candidate === button));
+            }
+            updateControlAvailability();
+          });
+          item.appendChild(button);
+          pathPickerEntries.appendChild(item);
+        }
+        pathPickerSelect.disabled = pathPicker.selection === "wav";
+        updateControlAvailability();
+      }
+
+      function closePathDialog() {
+        if (pathPickerDialog.open) pathPickerDialog.close();
+        pathPicker.selection = null;
+        pathPicker.currentPath = null;
+        pathPicker.pendingPath = null;
+        pathPicker.parentPath = null;
+        pathPicker.onSelect = null;
+      }
+
+      async function postJson(url, body) {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: body ? JSON.stringify(body) : null,
+        });
+        let payload;
+        try {
+          payload = await response.json();
+        } catch (_error) {
+          throw new Error(`Server returned a non-JSON response (HTTP ${response.status})`);
+        }
+        if (!response.ok) {
+          throw new Error(typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail));
+        }
+        appState.state = payload.state;
+        const laneCountChanged = payload.lanes && payload.lanes !== appState.lanes;
+        if (laneCountChanged) {
+          loadDraftFromPayload(payload);
+          renderLaneGrid();
+          renderLaneInputControls();
+        }
+        renderStatus();
+        return payload;
+      }
+
+      async function validateModelSelection() {
+        const response = await fetch("/api/models/validate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ offline_model_id: appState.draft.offlineModelId, offline_model_dir: appState.draft.offlineModelDir }),
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || "Model validation failed");
+        if (!payload.valid) {
+          showError(payload.missing_files.join("\n"));
+          return false;
+        }
+        showError("");
+        return true;
+      }
+
+      async function loadHealth() {
+        const response = await fetch("/health");
+        const payload = await response.json();
+        appState.state = payload.state;
+        const laneCountChanged = loadDraftFromPayload(payload);
+        if (laneCountChanged || appState.laneEntries.size === 0) {
+          renderLaneGrid();
+          renderLaneInputControls();
+        }
+        renderStatus();
+      }
+
+      async function refreshOperationalState() {
+        const response = await fetch("/health");
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || "Unable to refresh service state");
+        appState.state = payload.state;
+        renderStatus();
+      }
+
+      async function waitForRecognitionCompletion() {
+        completionRefreshTimer = null;
+        try {
+          await refreshOperationalState();
+          if (["starting", "running", "stopping"].includes(appState.state)) {
+            completionRefreshTimer = window.setTimeout(waitForRecognitionCompletion, 100);
+            return;
+          }
+          if (appState.state === "loaded") setOperation("Recognition completed.");
+        } catch (error) {
+          showError(error.message);
+        }
+      }
+
+      async function pollLoadPhase() {
+        try {
+          const response = await fetch("/health");
+          if (!response.ok) return;
+          const payload = await response.json();
+          if (payload.load_phase === "warming_zipformer") {
+            setOperation("Warming up Zipformer...");
+          }
+        } catch (_error) {
+          // The load request remains authoritative if a status poll fails.
+        }
+      }
+
+      function startLoadPhasePolling() {
+        stopLoadPhasePolling();
+        pollLoadPhase().catch(() => {});
+        loadPhaseTimer = window.setInterval(pollLoadPhase, 250);
+      }
+
+      function stopLoadPhasePolling() {
+        if (loadPhaseTimer === null) return;
+        window.clearInterval(loadPhaseTimer);
+        loadPhaseTimer = null;
+      }
+
+      function handleLaneFinished(event) {
+        appState.finishedLanes.add(event.stream_id);
+        if (appState.finishedLanes.size === appState.lanes && completionRefreshTimer === null) {
+          completionRefreshTimer = window.setTimeout(waitForRecognitionCompletion, 0);
+        }
+      }
+
+      function flushPendingEvents() {
+        const pendingPartials = appState.pendingPartials;
+        const pendingNonPartials = appState.pendingNonPartials;
+        appState.pendingPartials = new Map();
+        appState.pendingNonPartials = [];
+        appState.eventFlushScheduled = false;
+        const queuedEvents = [
+          ...Array.from(pendingPartials.values()).filter((event) => {
+            const currentRevision = appState.revisions.get(laneKey(event.stream_id, event.sentence_id));
+            return currentRevision === undefined || event.revision >= currentRevision;
+          }),
+          ...pendingNonPartials,
+        ];
+        if (queuedEvents.length === 0) return;
+        for (const event of queuedEvents) {
+          if (!renderLaneEvent(event)) {
+            appState.eventCount -= 1;
+            continue;
+          }
+          if (event.status === "fatal_error") {
+            appState.state = "fatal";
+          }
+          if (event.status === "lane_finished") handleLaneFinished(event);
+        }
+        renderStatus();
+      }
+
+      function queueWebSocketEvent(event) {
+        const key = laneKey(event.stream_id, event.sentence_id);
+        const currentRevision = appState.revisions.get(key) ?? -1;
+        const tracksRevision = ["partial", "pending", "final"].includes(event.status);
+        if (tracksRevision && event.revision <= currentRevision) return;
+        if (tracksRevision) appState.revisions.set(key, event.revision);
+        appState.eventCount += 1;
+        if (event.status === "partial") {
+          appState.pendingPartials.set(key, event);
+        } else {
+          appState.pendingNonPartials.push(event);
+        }
+        if (!appState.eventFlushScheduled) {
+          appState.eventFlushScheduled = true;
+          window.requestAnimationFrame(flushPendingEvents);
+        }
+      }
+
+      function connectWebSocket() {
+        const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+        const socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
+        appState.socket = socket;
+        socket.addEventListener("open", () => { connectionState.textContent = "Connected"; });
+        socket.addEventListener("close", () => {
+          connectionState.textContent = "Disconnected";
+          window.setTimeout(connectWebSocket, 1000);
+        });
+        socket.addEventListener("message", (message) => {
+          const event = JSON.parse(message.data);
+          queueWebSocketEvent(event);
+        });
+      }
+
+      laneSelect.addEventListener("change", () => {
+        appState.lanes = Number(laneSelect.value);
+        ensureDraftLaneInputs();
+        renderLaneGrid();
+        renderLaneInputControls();
+      });
+      offlineModelSelect.addEventListener("change", () => {
+        appState.draft.offlineModelId = offlineModelSelect.value;
+        appState.draft.offlineModelDir = appState.offlineModelDirectories[offlineModelSelect.value];
+        offlineModelDirectory.textContent = appState.draft.offlineModelDir;
+      });
+      offlineModelPicker.addEventListener("click", () => {
+        openPathDialog({
+          selection: "directory",
+          value: appState.draft.offlineModelDir,
+          onSelect: (selectedPath) => {
+            appState.draft.offlineModelDir = selectedPath;
+            offlineModelDirectory.textContent = selectedPath;
+          },
+        }).catch((error) => showError(error.message));
+      });
+      pathPickerClose.addEventListener("click", closePathDialog);
+      pathPickerCancel.addEventListener("click", closePathDialog);
+      pathPickerUp.addEventListener("click", () => {
+        if (!pathPicker.parentPath) return;
+        loadPathEntries(pathPicker.parentPath).catch((error) => showError(error.message));
+      });
+      pathPickerSelect.addEventListener("click", () => {
+        const selectedPath = pathPicker.selection === "directory"
+          ? pathPicker.currentPath
+          : pathPicker.pendingPath;
+        if (!selectedPath || !pathPicker.onSelect) return;
+        pathPicker.onSelect(selectedPath);
+        closePathDialog();
+      });
+      pathPickerDialog.addEventListener("cancel", (event) => {
+        event.preventDefault();
+        closePathDialog();
+      });
+      loadButton.addEventListener("click", async () => {
+        try {
+          setOperation("Validating model files...");
+          if (!(await validateModelSelection())) return;
+          appState.state = "loading";
+          setOperation("Loading models...");
+          renderStatus();
+          startLoadPhasePolling();
+          try {
+            await postJson("/api/models/load", {
+              lanes: appState.lanes,
+              offline_model_id: appState.draft.offlineModelId,
+              offline_model_dir: appState.draft.offlineModelDir,
+            });
+          } finally {
+            stopLoadPhasePolling();
+          }
+          setOperation("Models loaded.");
+        } catch (error) {
+          showError(error.message);
+          await refreshOperationalState();
+        }
+      });
+      unloadButton.addEventListener("click", async () => {
+        try {
+          appState.state = "unloading";
+          setOperation("Unloading models...");
+          renderStatus();
+          await postJson("/api/models/unload");
+          setOperation("Models unloaded.");
+        } catch (error) {
+          showError(error.message);
+          await refreshOperationalState();
+        }
+      });
+      document.getElementById("start-recognition").addEventListener("click", async () => {
+        const snapshot = snapshotRecognitionView();
+        let recognitionStartSubmitted = false;
+        appState.laneInputSubmissionPending = true;
+        setOperation("Validating audio inputs...");
+        renderStatus();
+        try {
+          await postJson("/api/lane-inputs", {
+            lane_inputs: appState.draft.laneInputs,
+          });
+          appState.laneInputSubmissionPending = false;
+          appState.state = "starting";
+          setOperation("Starting recognition...");
+          renderStatus();
+          recognitionStartSubmitted = true;
+          await postJson("/api/recognition/start");
+          resetRecognitionView();
+          setOperation("Recognition running.");
+        } catch (error) {
+          appState.laneInputSubmissionPending = false;
+          if (!recognitionStartSubmitted) restoreRecognitionView(snapshot);
+          showError(error.message);
+          await refreshOperationalState();
+        }
+      });
+      stopButton.addEventListener("click", async () => {
+        try {
+          appState.state = "stopping";
+          setOperation("Stopping recognition...");
+          renderStatus();
+          await postJson("/api/recognition/stop");
+          setOperation("Recognition stopped.");
+        } catch (error) {
+          showError(error.message);
+          await loadHealth();
+        }
+      });
+
+      renderStatus();
+      loadHealth().catch((error) => showError(error.message));
+      connectWebSocket();
+    </script>
+  </body>
+</html>

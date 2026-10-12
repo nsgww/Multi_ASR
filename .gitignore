@@ -1,0 +1,13 @@
+.superpowers/
+.venv/
+.venv313/
+.worktrees/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+runs/
+models/
+*.bak
+*.bak2
+*.egg-info/
+src/multi_stream_asr/assets/wav16k/

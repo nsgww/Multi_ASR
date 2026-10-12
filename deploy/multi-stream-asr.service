@@ -1,0 +1,20 @@
+[Unit]
+Description=Multi Stream ASR Web Service
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bianbu
+Group=bianbu
+WorkingDirectory=/opt/multi-stream-asr
+Environment=PYTHONPATH=/opt/multi-stream-asr/src
+ExecStart=/opt/envs/multi-stream-asr/bin/python -m multi_stream_asr.main --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=multi-stream-asr
+
+[Install]
+WantedBy=multi-user.target

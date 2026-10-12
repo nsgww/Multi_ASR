@@ -1,0 +1,21 @@
+{
+  "architectures": ["Qwen3ASRForConditionalGeneration"],
+  "support_languages": ["Chinese", "English", "Cantonese", "Arabic", "German", "French", "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian", "Thai", "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay", "Dutch", "Swedish", "Danish", "Finnish", "Polish", "Czech", "Filipino", "Persian", "Greek", "Romanian", "Hungarian", "Macedonian"],
+  "audio_model": {
+    "frontend_model_path": "Qwen3-ASR-1.7B-encoder-frontend.dynq.onnx",
+    "backend_model_path": "Qwen3-ASR-1.7B-encoder-backend.dynq.onnx",
+    "num_mel_bins": 128,
+    "sample_rate": 16000,
+    "n_fft": 400,
+    "window_len": 400,
+    "hop_len": 160,
+    "chunk_frames": 100,
+    "chunk_tokens": 13,
+    "d_model": 1024,
+    "hidden_size": 2048,
+    "output_dim": 2048,
+    "special_tokens": {"audio_start_token": "<|audio_start|>", "audio_end_token": "<|audio_end|>", "audio_token": "<|audio_pad|>", "audio_start_token_id": 151669, "audio_end_token_id": 151670, "audio_token_id": 151676}
+  },
+  "text_model": {"model_path": "Qwen3-ASR-1.7B-text-q4km.gguf", "context_size": 65536, "logical_batch_size": 2048, "predict_token": 256, "vocab_size": 151936, "hidden_size": 2048},
+  "prompt": {"system_prefix_token": "<|im_start|>system", "user_prefix_token": "<|im_start|>user", "assistant_prefix_token": "<|im_start|>assistant", "message_suffix_token": "<|im_end|>", "asr_text_tag": "<asr_text>"}
+}
