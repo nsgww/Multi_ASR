@@ -17,7 +17,7 @@ PCM、NumPy 数组、segment cache、Qwen 原始响应和结果文件内容都�
 
 - 1 个主 Python 进程，运行主 asyncio event loop 和 `ProcessPipelineManager`。
 - `N` 个 lane Python 子进程，由 `multiprocessing` 的 `spawn` 上下文创建。
-- 1 个 `llama-multi-asr` 进程，由主 Python 进程启动、监控和停止。
+- 1 个 `llama-server`（`--media-backend smt`）进程，由主 Python 进程启动、监控和停止。
 - 每个 lane 有 1 个 Python 主线程，承载该 lane 的 asyncio event loop。
 - 每个 lane 创建 1 个 `asr-lane-X-audio-producer` 音频生产线程。
 - 每个 lane 创建 1 个 `asr-lane-X-zipformer-consumer` Zipformer 消费线程。
@@ -26,7 +26,7 @@ PCM、NumPy 数组、segment cache、Qwen 原始响应和结果文件内容都�
 服务进程；4 个 lane 合计创建 8 个专用 pipeline 工作线程。
 
 asyncio 默认 executor、sherpa-onnx、ONNX Runtime、SpaceMiT EP、HTTP 库和
-`llama-multi-asr` 还可能按需创建内部线程。因此 `ps -eLf` 或 `/proc/<pid>/task` 中的
+`llama-server` 还可能按需创建内部线程。因此 `ps -eLf` 或 `/proc/<pid>/task` 中的
 Linux task 总数会高于上述数量，不能把 task 总数等同于项目配置的推理线程数。
 
 ## Pipeline 顺序
@@ -42,13 +42,15 @@ Web 模式的 `FrontendEventBus.broadcast_loop()` 运行在主 event loop 中，
 
 ### 2. 启动共享 Qwen 服务
 
-真实模式先由主进程生成共享 Qwen 配置并启动唯一的 `llama-multi-asr`。固定关键参数为：
+真实模式先由主进程启动唯一的 `llama-server`（`--media-backend smt --smt-multi-asr`，
+`--smt-config-dir` 指向模型目录，encoder 线程/绑核由模型目录自带 config.json 决定）。
+固定关键参数为：
 
-- q40 文本模型；
-- encoder 线程数 2，亲和配置 `8;9`；
-- decoder cores `10,11,12,13,14,15`，线程数 6；
-- `--n-parallel 4`；
-- `--n-ctx 8192`。
+- q4km 文本模型；
+- decoder 线程 `-t 6 -tb 6`；
+- `-np 4`；
+- `-c 8192`；
+- `--cache-reuse 0`。
 
 主进程必须等待健康检查成功，才会创建 lane 子进程。服务启动失败时不会启动任何 lane。
 运行期间 watchdog 周期检查共享服务；若服务异常退出，主进程记录 fatal，并向所有存活

@@ -26,91 +26,77 @@ class ZipformerRecognizer:
         provider_config: str | Path | None = None,
         hotwords_file: str | Path | None = None,
         hotwords_score: float = 1.5,
-        shared_recognizer: Any | None = None,
-        shared_lock: threading.Lock | None = None,
-        shared_runtime: Any | None = None,
     ) -> None:
         try:
             import sherpa_onnx
         except ImportError as exc:
             raise RuntimeError("sherpa-onnx is required for ZipformerRecognizer") from exc
 
-        self._runtime = shared_runtime
         self._sample_rate = sample_rate
-        self._lock = shared_lock or threading.Lock()
+        self._lock = threading.Lock()
 
         # vad_driven=True 的识别器（如 funasr paraformer）端点检测不可用，
-        # 断句交给 pipeline 的能量 VAD；透传给 LanePipeline 自动切换断句模式
-        self.vad_driven = getattr(shared_recognizer, "vad_driven", False)
-        if shared_recognizer is not None:
-            self._recognizer = shared_recognizer
-            self._owns_recognizer = False
-        else:
-            if model_dir is None or endpoint is None:
-                raise ValueError(
-                    "model_dir and endpoint are required when shared_recognizer is not provided"
-                )
-            model_path = Path(model_dir)
-            tokens = self._require_file(model_path / "tokens.txt")
-            decoder = self._pick_onnx(model_path, "decoder")
-            joiner = self._pick_onnx(model_path, "joiner")
-            resolved_provider = provider.strip().lower()
-            if resolved_provider == "spacemit":
-                if provider_config is not None:
-                    config_path = self._require_file(Path(provider_config))
-                else:
-                    config_path = model_path / "zipformer.config"
-                    if not config_path.is_file():
-                        # 社区模型没有进迭 EP 配置时生成默认配置（与 lane 配置同内容）
-                        config_path.write_text(
-                            "SPACEMIT_EP_PERFER_CORE_ARCH = 0x5064\n"
-                            "SPACEMIT_EP_INTRA_THREAD_NUM = 1\n"
-                            "SPACEMIT_EP_USE_GLOBAL_INTRA_THREAD = 1\n",
-                            encoding="utf-8",
-                        )
-                        _logger.info("生成默认 zipformer.config: %s", config_path)
-                provider_arg = f"spacemit:{config_path}"
-                # 兜底顺序：.q.onnx（进迭定制量化，最快）→ int8（EP 实测可加速）→ fp32
-                encoder = self._pick_onnx(model_path, "encoder", prefer_q=True)
-            elif resolved_provider == "cpu":
-                provider_arg = "cpu"
-                encoder = self._pick_onnx(model_path, "encoder")
+        # 断句交给 pipeline 的能量 VAD；zipformer 自身恒为 False
+        self.vad_driven = False
+        if model_dir is None or endpoint is None:
+            raise ValueError("model_dir and endpoint are required")
+        model_path = Path(model_dir)
+        tokens = self._require_file(model_path / "tokens.txt")
+        decoder = self._pick_onnx(model_path, "decoder")
+        joiner = self._pick_onnx(model_path, "joiner")
+        resolved_provider = provider.strip().lower()
+        if resolved_provider == "spacemit":
+            if provider_config is not None:
+                config_path = self._require_file(Path(provider_config))
             else:
-                raise RuntimeError(f"Unsupported Zipformer provider: {provider}")
+                config_path = model_path / "zipformer.config"
+                if not config_path.is_file():
+                    # 社区模型没有进迭 EP 配置时生成默认配置（与 lane 配置同内容）
+                    config_path.write_text(
+                        "SPACEMIT_EP_PERFER_CORE_ARCH = 0x5064\n"
+                        "SPACEMIT_EP_INTRA_THREAD_NUM = 1\n"
+                        "SPACEMIT_EP_USE_GLOBAL_INTRA_THREAD = 1\n",
+                        encoding="utf-8",
+                    )
+                    _logger.info("生成默认 zipformer.config: %s", config_path)
+            provider_arg = f"spacemit:{config_path}"
+            # 兜底顺序：.q.onnx（进迭定制量化，最快）→ int8（EP 实测可加速）→ fp32
+            encoder = self._pick_onnx(model_path, "encoder", prefer_q=True)
+        elif resolved_provider == "cpu":
+            provider_arg = "cpu"
+            encoder = self._pick_onnx(model_path, "encoder")
+        else:
+            raise RuntimeError(f"Unsupported Zipformer provider: {provider}")
 
-            def _create() -> Any:
-                decoding_method = "greedy_search"
-                extra: dict[str, Any] = {}
-                if hotwords_file is not None:
-                    # 热词偏置只在 modified_beam_search 下生效
-                    decoding_method = "modified_beam_search"
-                    extra["hotwords_file"] = str(hotwords_file)
-                    extra["hotwords_score"] = hotwords_score
-                return sherpa_onnx.OnlineRecognizer.from_transducer(
-                    tokens=str(tokens),
-                    encoder=str(encoder),
-                    decoder=str(decoder),
-                    joiner=str(joiner),
-                    num_threads=1,
-                    sample_rate=sample_rate,
-                    feature_dim=feature_dim,
-                    enable_endpoint_detection=True,
-                    rule1_min_trailing_silence=endpoint.rule1_min_trailing_silence,
-                    rule2_min_trailing_silence=endpoint.rule2_min_trailing_silence,
-                    rule3_min_utterance_length=endpoint.rule3_min_utterance_length,
-                    decoding_method=decoding_method,
-                    provider=provider_arg,
-                    **extra,
-                )
+        def _create() -> Any:
+            decoding_method = "greedy_search"
+            extra: dict[str, Any] = {}
+            if hotwords_file is not None:
+                # 热词偏置只在 modified_beam_search 下生效
+                decoding_method = "modified_beam_search"
+                extra["hotwords_file"] = str(hotwords_file)
+                extra["hotwords_score"] = hotwords_score
+            return sherpa_onnx.OnlineRecognizer.from_transducer(
+                tokens=str(tokens),
+                encoder=str(encoder),
+                decoder=str(decoder),
+                joiner=str(joiner),
+                num_threads=1,
+                sample_rate=sample_rate,
+                feature_dim=feature_dim,
+                enable_endpoint_detection=True,
+                rule1_min_trailing_silence=endpoint.rule1_min_trailing_silence,
+                rule2_min_trailing_silence=endpoint.rule2_min_trailing_silence,
+                rule3_min_utterance_length=endpoint.rule3_min_utterance_length,
+                decoding_method=decoding_method,
+                provider=provider_arg,
+                **extra,
+            )
 
-            self._recognizer: Any = self._call(_create)
-            self._owns_recognizer = True
-
+        self._recognizer: Any = self._call(_create)
         self._stream = self._call(self._recognizer.create_stream)
 
     def _call(self, fn: Callable[[], T]) -> T:
-        if self._runtime is not None:
-            return self._runtime.call(fn)
         with self._lock:
             return fn()
 
@@ -149,7 +135,11 @@ class ZipformerRecognizer:
 
             is_endpoint = self._recognizer.is_endpoint(self._stream)
             if is_endpoint:
-                self._recognizer.reset(self._stream)
+                # 端点切分必须换新流，不能 reset() 复用：sherpa-onnx 的
+                # reset(stream) 在静音期触发后会让后续解码持续输出 blank
+                # （整句静默丢失，本地仿真稳定复现）；create_stream 无此问题。
+                # 注意此处已在 _call 序列化上下文内，直接调用避免嵌套死锁。
+                self._stream = self._recognizer.create_stream()
 
             stripped = text.strip()
             if decode_count or stripped:
@@ -195,8 +185,7 @@ class ZipformerRecognizer:
 
     async def close(self) -> None:
         def work() -> None:
-            if self._owns_recognizer:
-                self._recognizer = None
+            self._recognizer = None
             self._stream = None
 
         self._call(work)

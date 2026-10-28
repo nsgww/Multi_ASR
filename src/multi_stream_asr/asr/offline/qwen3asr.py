@@ -27,8 +27,8 @@ _HOTWORDS_ECHO_RE = re.compile(r"热词：[^。\n]*。?")
 def build_hotwords_user_prompt(hotwords: tuple[str, ...]) -> str:
     """构造带热词引导的 user 文本。
 
-    注意：llama-multi-asr 会丢弃 system 消息（2026-08-04 实测），只能走
-    user 文本前缀；且 1.7B 对"可能出现的专有名词："长格式会返回空/幻觉，
+    注意：SMT ASR 服务（llama-server --smt-multi-asr）会丢弃 system 消息
+    （2026-08-04 实测），只能走 user 文本前缀；且 1.7B 对"可能出现的专有名词："长格式会返回空/幻觉，
     必须用"热词："简式（2026-08-04 提示词矩阵实验结论）。
     """
     return f"{HOTWORDS_PROMPT_PREFIX}{'、'.join(hotwords)}。" + QWEN_USER_PROMPT

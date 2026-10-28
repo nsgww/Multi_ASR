@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -16,43 +17,8 @@ from multi_stream_asr.utils.process import run_best_effort
 
 
 SHARED_CONFIG_DIR = Path("/tmp/multi-stream-asr/shared-qwen")
-SHARED_PID_PATH = SHARED_CONFIG_DIR / "llama-multi-asr.pid"
-SHARED_LOG_PATH = SHARED_CONFIG_DIR / "llama-multi-asr.log"
-TEXT_MODEL_NAME = "Qwen3-ASR-0.6B-text-q40.gguf"
-FRONTEND_MODEL_NAME = "Qwen3-ASR-0.6B-encoder-frontend.dynq.onnx"
-BACKEND_MODEL_NAME = "Qwen3-ASR-0.6B-encoder-backend.dynq.onnx"
-SUPPORT_LANGUAGES = (
-    "Chinese",
-    "English",
-    "Cantonese",
-    "Arabic",
-    "German",
-    "French",
-    "Spanish",
-    "Portuguese",
-    "Indonesian",
-    "Italian",
-    "Korean",
-    "Russian",
-    "Thai",
-    "Vietnamese",
-    "Japanese",
-    "Turkish",
-    "Hindi",
-    "Malay",
-    "Dutch",
-    "Swedish",
-    "Danish",
-    "Finnish",
-    "Polish",
-    "Czech",
-    "Filipino",
-    "Persian",
-    "Greek",
-    "Romanian",
-    "Hungarian",
-    "Macedonian",
-)
+SHARED_PID_PATH = SHARED_CONFIG_DIR / "llama-server.pid"
+SHARED_LOG_PATH = SHARED_CONFIG_DIR / "llama-server.log"
 
 
 @dataclass(frozen=True)
@@ -65,76 +31,52 @@ class SharedQwenServerSpec:
     command: list[str]
 
 
-def build_shared_config(config: AppConfig) -> dict[str, object]:
-    model = config.models.offline_model
-    shared = config.shared_qwen
-    return {
-        "architectures": ["Qwen3ASRForConditionalGeneration"],
-        "support_languages": list(SUPPORT_LANGUAGES),
-        "audio_model": {
-            "frontend_model_path": str(model.model_dir / model.frontend_filename),
-            "backend_model_path": str(model.model_dir / model.backend_filename),
-            "spacemit_ep_intra_thread_num": shared.encoder_thread_num,
-            "spacemit_ep_inter_thread_num": 1,
-            "spacemit_ep_intra_thread_affinity": shared.encoder_affinity,
-            "num_mel_bins": 128,
-            "sample_rate": 16000,
-            "n_fft": 400,
-            "window_len": 400,
-            "hop_len": 160,
-            "chunk_frames": 100,
-            "chunk_tokens": 13,
-            "d_model": model.d_model,
-            "hidden_size": model.hidden_size,
-            "output_dim": model.output_dim,
-            "special_tokens": {
-                "audio_start_token": "<|audio_start|>",
-                "audio_end_token": "<|audio_end|>",
-                "audio_token": "<|audio_pad|>",
-                "audio_start_token_id": 151669,
-                "audio_end_token_id": 151670,
-                "audio_token_id": 151676,
-            },
-        },
-        "text_model": {
-            "model_path": str(model.model_dir / model.text_model_filename),
-            "context_size": 65536,
-            "logical_batch_size": 2048,
-            "predict_token": 256,
-            "vocab_size": 151936,
-            "hidden_size": model.hidden_size,
-        },
-        "prompt": {
-            "system_prefix_token": "<|im_start|>system",
-            "user_prefix_token": "<|im_start|>user",
-            "assistant_prefix_token": "<|im_start|>assistant",
-            "message_suffix_token": "<|im_end|>",
-            "asr_text_tag": "<asr_text>",
-        },
-    }
+def resolve_llama_server() -> Path:
+    """定位系统 llama-server（SpacemiT 定制版，/usr/bin/llama-server）。"""
+    candidate = shutil.which("llama-server")
+    if candidate is None:
+        raise FileNotFoundError(
+            "system llama-server is unavailable; install llama.cpp and verify PATH"
+        )
+    server_path = Path(candidate).resolve(strict=True)
+    if not server_path.is_file() or not os.access(server_path, os.X_OK):
+        raise FileNotFoundError(f"llama-server is not executable: {server_path}")
+    return server_path
 
 
-def build_launch_command(config: AppConfig, config_dir: Path) -> list[str]:
+def build_launch_command(config: AppConfig, server_path: Path) -> list[str]:
+    """llama-server（--media-backend smt）启动命令。
+
+    纠错后端用 llama-server 而非 llama-multi-asr：同模型同音频实测快约 14%
+    （1.31s vs 1.52s，2026-10-27 K3 实测）。--smt-config-dir 直接指向模型目录
+    （其中自带 config.json + encoder onnx）；--smt-multi-asr 必须打开，否则
+    输出会把 prompt 回声出来并截断。
+    """
     shared = config.shared_qwen
     model = config.models.offline_model
     return [
-        str(shared.runtime_dir / "bin" / "llama-multi-asr"),
+        str(server_path),
         "-m",
         str(model.model_dir / model.text_model_filename),
+        "--media-backend",
+        "smt",
         "--smt-config-dir",
-        str(config_dir),
+        str(model.model_dir),
+        "--smt-multi-asr",
         "--host",
         shared.host,
         "--port",
         str(shared.port),
-        "--decoder-cores",
-        shared.decoder_cores,
-        "--decoder-n-threads",
-        str(shared.decoder_threads),
-        "--n-parallel",
+        "-np",
         str(shared.n_parallel),
-        "--n-ctx",
+        "-c",
         str(shared.n_ctx),
+        "-t",
+        str(shared.decoder_threads),
+        "-tb",
+        str(shared.decoder_threads),
+        "--cache-reuse",
+        "0",
         "--warmup",
     ]
 
@@ -190,7 +132,6 @@ class SharedQwenServerManager:
         spec = self._build_spec()
         self._validate_files(spec)
         self._config_dir.mkdir(parents=True, exist_ok=True)
-        self._write_config()
         self._log_handle = self._log_path.open("w", encoding="utf-8")
         try:
             self._process = subprocess.Popen(
@@ -199,6 +140,9 @@ class SharedQwenServerManager:
                 stdout=self._log_handle,
                 stderr=self._log_handle,
                 text=True,
+                # 纠错服务对延迟不敏感：降调度优先级，把 CPU 让给流式识别主链路，
+                # 避免 Qwen 编码/解码高峰期抢占导致帧缓冲溢出、整句语音被丢弃
+                preexec_fn=lambda: os.nice(int(os.getenv("QWEN_NICE", "10"))),
             )
             self._pid_path.write_text(f"{self._process.pid}\n", encoding="utf-8")
             self._wait_for_health()
@@ -230,35 +174,25 @@ class SharedQwenServerManager:
 
     def _build_spec(self) -> SharedQwenServerSpec:
         shared = self._config.shared_qwen
-        env = os.environ.copy()
-        lib_paths = f"{shared.runtime_dir / 'lib'}:{shared.runtime_dir / 'ort_lib'}"
-        existing = env.get("LD_LIBRARY_PATH")
-        env["LD_LIBRARY_PATH"] = f"{lib_paths}:{existing}" if existing else lib_paths
-        env["SPACEMIT_PERFER_CORE_ID"] = shared.decoder_cores
         return SharedQwenServerSpec(
             port=shared.port,
             config_dir=self._config_dir,
             log_path=self._log_path,
             pid_path=self._pid_path,
-            env=env,
-            command=build_launch_command(self._config, self._config_dir),
+            env=os.environ.copy(),
+            command=build_launch_command(self._config, resolve_llama_server()),
         )
 
     def _validate_files(self, spec: SharedQwenServerSpec) -> None:
         model = self._config.models.offline_model
         required = [
             Path(spec.command[0]),
+            model.model_dir / "config.json",
             *(model.model_dir / filename for filename in model.required_filenames),
         ]
         for path in required:
             if not path.is_file():
                 raise FileNotFoundError(f"required shared qwen file not found: {path}")
-
-    def _write_config(self) -> None:
-        (self._config_dir / "config.json").write_text(
-            json.dumps(build_shared_config(self._config), indent=2),
-            encoding="utf-8",
-        )
 
     def _wait_for_health(self) -> None:
         shared = self._config.shared_qwen
@@ -267,12 +201,12 @@ class SharedQwenServerManager:
         while time.monotonic() < deadline:
             if self._process is not None and self._process.poll() is not None:
                 raise RuntimeError(
-                    f"llama-multi-asr exited before health check: {self._process.poll()}"
+                    f"llama-server exited before health check: {self._process.poll()}"
                 )
             if is_server_healthy(url, timeout=min(self._poll_interval_seconds, 2.0)):
                 return
             time.sleep(self._poll_interval_seconds)
-        raise RuntimeError(f"llama-multi-asr health timed out on port {shared.port}")
+        raise RuntimeError(f"llama-server health timed out on port {shared.port}")
 
     def _read_pid(self) -> int | None:
         try:
@@ -296,9 +230,10 @@ class SharedQwenServerManager:
     def _matches_owned_command(self, command: list[str]) -> bool:
         if not command:
             return False
-        expected_binary = str(
-            (self._config.shared_qwen.runtime_dir / "bin" / "llama-multi-asr").resolve()
-        )
+        try:
+            expected_binary = str(resolve_llama_server())
+        except FileNotFoundError:
+            return False
         try:
             actual_binary = str(Path(command[0]).resolve())
             port_index = command.index("--port")

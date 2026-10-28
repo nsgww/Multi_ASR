@@ -144,6 +144,9 @@ class FrontendEventBus:
             if self._is_stale_partial(event):
                 continue
             payload = asdict(event)
+            # 声纹关闭时不把 speaker:null 发出去，保持与改动前一致的报文形状
+            if payload.get("speaker") is None:
+                payload.pop("speaker", None)
             broken: list[Any] = []
             for websocket in tuple(self._websockets):
                 if self._is_stale_partial(event):

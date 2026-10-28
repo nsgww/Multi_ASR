@@ -57,6 +57,7 @@ from multi_stream_asr.models import (
     LaneMetrics,
     OnlineRecognition,
     QwenSentenceFailure,
+    SpeakerInfo,
 )
 from multi_stream_asr.web.event_bus import FrontendEventBus
 
@@ -86,12 +87,18 @@ class LanePipeline:
         on_qwen_error: Callable[[QwenSentenceFailure], None] | None = None,
         kws_session: SherpaKeywordSpotterSession | None = None,
         on_kws: Callable[[KWSResult], None] | None = None,
+        speaker_tracker: Any | None = None,
+        on_speaker: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.stream_id = stream_id
         self.online_recognizer = online_recognizer
         self.offline_recognizer = offline_recognizer
         self.event_bus = event_bus
         self.segment_cache = segment_cache
+        # 说话人跟踪器由 lane 进程（或会话管理器）按 lane 创建；None = 声纹关闭
+        self.speaker_tracker = speaker_tracker
+        self.on_speaker = on_speaker
+        self._last_speaker: SpeakerInfo | None = None
         self.endpoint = endpoint or EndpointConfig()
         self.latency_tracker = latency_tracker or LatencyTracker()
         self.rtf_tracker = rtf_tracker or RtfTracker()
@@ -191,7 +198,11 @@ class LanePipeline:
         self._loop = asyncio.get_running_loop()
         self._event_loop_thread_id = threading.get_ident()
         self._offline_scheduling_closed = False
-        frame_queue = OnlineFrameQueue(maxsize=10)
+        # 缓冲 50 帧（100ms/帧 ≈ 5s）：纠错/Qwen 抢占 CPU 时消费会短暂落后，
+        # 缓冲太小（原 10 帧 ≈ 1s）会触发丢最老帧，整句语音被静默丢弃
+        frame_queue = OnlineFrameQueue(
+            maxsize=int(os.getenv("FRAME_QUEUE_SIZE", "50"))
+        )
         self._frame_queue = frame_queue
         producer_done = threading.Event()
         stop_requested = threading.Event()
@@ -786,9 +797,20 @@ class LanePipeline:
             if previous_task is not None:
                 await previous_task
 
+            # 声纹与离线 ASR 共用同一段 pcm，并行跑：
+            # ASR 1.5~5s、声纹 0.1~0.3s，声纹开销被完全掩盖，FINAL 时刻不变。
+            speaker_task = self._start_speaker_task(pcm)
+            result = None
+            error: QwenRequestError | None = None
             try:
                 result = await self.offline_recognizer.recognize(pcm=pcm, prompt=prompt)
             except QwenRequestError as exc:
+                error = exc
+
+            # 无论 ASR 成功与否都要把声纹任务收干净，避免悬空 task
+            speaker = await self._collect_speaker(speaker_task, sentence_id)
+
+            if error is not None:
                 if self.on_qwen_error is not None:
                     self.on_qwen_error(
                         QwenSentenceFailure(
@@ -797,9 +819,11 @@ class LanePipeline:
                             revision=revision,
                             pending_text=prompt,
                             timestamp_ms=timestamp_ms,
-                            request=exc.failure.to_payload(),
+                            request=error.failure.to_payload(),
                         )
                     )
+                return
+            if result is None:
                 return
 
             if self.on_qwen_success is not None:
@@ -838,6 +862,7 @@ class LanePipeline:
                 status=EventStatus.FINAL,
                 text=result.text,
                 timestamp_ms=timestamp_ms,
+                speaker=speaker,
             )
 
         task = asyncio.create_task(run_offline())
@@ -884,6 +909,69 @@ class LanePipeline:
                 timestamp_ms=timestamp_ms,
             )
         )
+
+    # ---------- 说话人分离 / 声纹 ----------
+
+    def _start_speaker_task(self, pcm: np.ndarray) -> asyncio.Task | None:
+        """把声纹分配丢进线程池并立刻返回 task。
+
+        声纹是纯 CPU 的 ONNX 推理，放线程池才不会卡住事件循环；
+        与离线 ASR 的 await 并行，所以不增加 FINAL 延迟。
+        """
+        tracker = self.speaker_tracker
+        if tracker is None or not getattr(tracker, "enabled", False):
+            return None
+        if getattr(pcm, "size", 0) == 0:
+            return None
+        try:
+            return asyncio.create_task(asyncio.to_thread(tracker.assign, pcm))
+        except Exception:
+            _logger.exception("创建声纹任务失败 lane=%d", self.stream_id)
+            return None
+
+    async def _collect_speaker(
+        self, task: asyncio.Task | None, sentence_id: int
+    ) -> SpeakerInfo | None:
+        """等声纹任务结束。任何异常都降级成"无说话人"。"""
+        if task is None:
+            return None
+        try:
+            info = await task
+        except Exception:
+            _logger.exception(
+                "声纹分配失败 lane=%d sentence=%d", self.stream_id, sentence_id
+            )
+            return None
+        if info is not None:
+            self._last_speaker = info
+        return info
+
+    async def _emit_speaker_remap(self) -> None:
+        """会话末二遍重聚类，把开头几句的错标一次性纠正。
+
+        通过 ``on_speaker`` 回调把 ``旧标签 -> 新标签`` 映射发给前端/落盘层；
+        消费方必须**原子地**套用整张表（不能链式逐条替换）。
+        """
+        tracker = self.speaker_tracker
+        if tracker is None or self.on_speaker is None:
+            return
+        try:
+            mapping = await asyncio.to_thread(tracker.resegment)
+        except Exception:
+            _logger.exception("二遍重聚类失败 lane=%d", self.stream_id)
+            return
+        if not mapping:
+            return
+        try:
+            self.on_speaker(
+                {
+                    "type": "speaker_remap",
+                    "lane_id": self.stream_id,
+                    "mapping": dict(mapping),
+                }
+            )
+        except Exception:
+            _logger.exception("speaker_remap 回调失败 lane=%d", self.stream_id)
 
     def _record_model_output(
         self,
@@ -948,6 +1036,9 @@ class LanePipeline:
         if self._offline_tasks:
             await asyncio.gather(*tuple(self._offline_tasks), return_exceptions=True)
             self._offline_tasks.clear()
+        # 二遍重聚类必须放在所有离线任务之后、LANE_FINISHED 之前，
+        # 保证修正映射在会话结束前送到前端/落盘层。
+        await self._emit_speaker_remap()
         if self._offline_error is not None:
             raise self._offline_error
         self._set_final_state(LaneFinalState.FINISHED)
@@ -977,6 +1068,7 @@ class LanePipeline:
         status: EventStatus,
         text: str,
         timestamp_ms: int,
+        speaker: SpeakerInfo | None = None,
     ) -> None:
         self._last_event_sentence_id = sentence_id
         self._last_event_revision = revision
@@ -988,6 +1080,7 @@ class LanePipeline:
             status=status,
             text=text,
             timestamp_ms=timestamp_ms,
+            speaker=speaker,
         )
         if self._loop is None:
             self.event_bus.publish(event)

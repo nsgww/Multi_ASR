@@ -14,8 +14,9 @@ from multi_stream_asr.asr.summary.config import SummaryConfig
 from multi_stream_asr.asr.summary.summary_client import SummaryClient
 from multi_stream_asr.asr.text_filter import SensitiveWordFilter
 from multi_stream_asr.audio.local_mic import LocalMicSource, find_first_input_device
-from multi_stream_asr.session.manager import Session, SessionManager
+from multi_stream_asr.session.process_pool import ProcessPoolSessionManager, Session
 from multi_stream_asr.web import messages as msg
+from multi_stream_asr.web.transcript_buffer import TranscriptBuffer, consume_event
 from multi_stream_asr.web.wakeup_gate import WakeupGate, WakeupSettings
 from multi_stream_asr.web.ws_utils import is_client_disconnect
 
@@ -32,7 +33,7 @@ class LocalMicHandler:
     def __init__(
         self,
         websocket: WebSocket,
-        session_manager: SessionManager,
+        session_manager: ProcessPoolSessionManager,
         *,
         summary_config: SummaryConfig,
         output_dir: Path,
@@ -63,7 +64,7 @@ class LocalMicHandler:
         self._paused = False
         self._finished_event = asyncio.Event()
         self._enable_summary = False
-        self._transcript_texts: list[str] = []
+        self._transcript = TranscriptBuffer()
         self._transcript_path: Path | None = None
 
     async def run(self) -> None:
@@ -304,7 +305,7 @@ class LocalMicHandler:
                 await self._session_manager.stop_session(self._session)
             self._session = None
 
-        self._transcript_texts = []
+        self._transcript.reset()
         self._transcript_path = None
         self._enable_summary = False
         self._started = False
@@ -346,10 +347,8 @@ class LocalMicHandler:
                         m,
                         segment=dict(seg, text=self._sensitive_filter.filter(seg["text"])),
                     )
-                if m.get("is_final"):
-                    text = m["segment"].get("text", "")
-                    if text:
-                        self._transcript_texts.append(text)
+            # final 文本与 speaker_remap 都喂给同一个缓冲，落盘时统一渲染
+            consume_event(self._transcript, m)
             asyncio.create_task(self._send(m))
 
     async def _send_loop(self) -> None:
@@ -373,9 +372,9 @@ class LocalMicHandler:
         return f"spacemit-asr-lane{lane_id}-{ts}.txt"
 
     async def _save_transcript(self) -> Path | None:
-        if not self._transcript_texts:
+        if not self._transcript:
             return None
-        full_text = "\n".join(self._transcript_texts).strip()
+        full_text = self._transcript.render()
         if not full_text:
             return None
         transcript_dir = self._output_dir / "transcripts"

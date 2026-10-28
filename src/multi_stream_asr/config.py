@@ -14,7 +14,6 @@ DEFAULT_ONLINE_MODEL_DIR = Path(
 )
 DEFAULT_OFFLINE_MODEL_DIR = Path("/var/lib/sm-sdk/models/asr/qwen3asr")
 DEFAULT_INPUT_DIR = Path(__file__).resolve().parent / "assets" / "wav16k"
-DEFAULT_SHARED_RUNTIME_DIR = PROJECT_ROOT / "multi-asr-runtime"
 DEFAULT_VAD_MODEL_DIR = Path("/var/lib/sm-sdk/models/vad/silero-vad/v5")
 DEFAULT_OFFLINE_ASR_MODEL_DIR = Path("/var/lib/sm-sdk/models/asr/sensevoice")
 DEFAULT_SUMMARY_CONFIG_PATH = PROJECT_ROOT / "summary.yaml"
@@ -23,6 +22,10 @@ DEFAULT_KWS_MODEL_DIR = Path(
     "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
 )
 DEFAULT_KWS_KEYWORDS_FILE = PROJECT_ROOT / "config" / "keywords.txt"
+DEFAULT_SPEAKER_MODEL_PATH = Path(
+    "/var/lib/sm-sdk/models/speaker/"
+    "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
+)
 ZIPFORMER_WARMUP_AUDIO_PATH = (
     Path(__file__).resolve().parent / "assets" / "zipformer_warmup.wav"
 )
@@ -156,7 +159,11 @@ def validate_offline_model_files(spec: OfflineModelSpec) -> list[Path]:
 
 @dataclass(frozen=True)
 class EndpointConfig:
-    rule1_min_trailing_silence: float = 1.0
+    # rule1（纯静音空端点，must_contain_nonsilence=False）必须保持远大于句间停顿：
+    # 它每 ~rule1 秒周期性触发空文本端点，端点换流时会吃掉下一句的开头
+    # （1.0s 时间隔的连续句子实测丢开头/整句）。设为 60s 等价于禁用，
+    # 真正的句切由 rule2（含语音、0.7s 尾部静音）承担。
+    rule1_min_trailing_silence: float = 60.0
     rule2_min_trailing_silence: float = 0.7
     rule3_min_utterance_length: float = 10.0
     cut_margin_seconds: float = 0.1
@@ -206,12 +213,10 @@ class ModelConfig:
 class SharedQwenConfig:
     host: str = "127.0.0.1"
     port: int = 8090
-    runtime_dir: Path = DEFAULT_SHARED_RUNTIME_DIR
-    encoder_thread_num: int = 2
-    encoder_affinity: str = "8;9"
-    decoder_cores: str = "10,11,12,13,14,15"
-    decoder_threads: int = 6
-    n_parallel: int = 4
+    # 纠错后端为系统 llama-server（--media-backend smt），encoder 线程/绑核
+    # 由模型目录自带 config.json 决定，这里只控制 decoder 线程数
+    decoder_threads: int = int(os.getenv("QWEN_DECODER_THREADS", "6"))
+    n_parallel: int = 8
     n_ctx: int = 8192
     request_timeout_ms: int = 120000
 
@@ -219,6 +224,70 @@ class SharedQwenConfig:
 @dataclass(frozen=True)
 class LaneConfig:
     stream_id: int
+
+
+@dataclass(frozen=True)
+class SpeakerConfig:
+    """说话人分离与声纹识别。
+
+    默认 **关闭**：``enabled=False`` 时 pipeline 完全不加载模型、不生成
+    ``speaker`` 字段，行为与改动前逐字节一致。
+
+    阈值默认值是按 CAM++ 在**干净近场**下的典型分布给的；混响远场必须重新
+    标定（同人余弦会从 0.6+ 掉到 0.4 附近），不要直接照搬。
+    """
+
+    enabled: bool = False
+    model_path: Path = DEFAULT_SPEAKER_MODEL_PATH
+    # 声纹库目录；None 表示用 <output_dir>/voiceprints。目录不存在=只做分离不做识别
+    registry_dir: Path | None = None
+    provider: str = "cpu"
+    num_threads: int = 1
+    sample_rate: int = 16000
+
+    # 段长下限：短于这个长度提不出可靠声纹，直接沿用上一句
+    min_duration_seconds: float = 1.2
+    # 多窗平均：混响下单窗不稳，切窗取均值
+    window_seconds: float = 1.5
+    hop_seconds: float = 0.5
+    # 首尾按能量裁剪的峰值比例（去混响拖尾）
+    trim_floor_ratio: float = 0.25
+
+    # 在线聚类
+    # 实测（CAM++ + 干净近场单人语音，见 README 6.2）：
+    #   同一人 3s 段之间 0.69~0.84；不同人 0.04~0.21 → 间隔约 0.48，很好分。
+    #   但带 BGM / 远场混响时同人会掉到 0.42、异人升到 0.53，分布直接重叠。
+    # 所以这组默认值只适用于干净近场；远场必须用 scripts/speaker_calibrate.py
+    # 按真实房间重新标定，别照搬。
+    match_threshold: float = 0.55
+    new_speaker_threshold: float = 0.45
+    merge_threshold: float = 0.70
+    max_speakers: int = 8
+    sticky_bonus: float = 0.05
+
+    # 1:N 声纹识别（双门限）。干净近场同人 0.69+，留足余量取 0.55。
+    identify_threshold: float = 0.55
+    identify_margin: float = 0.05
+
+    # 会话末全量重聚类（第二遍），用 revision/重标映射纠正早期错分
+    enable_second_pass: bool = True
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.new_speaker_threshold <= self.match_threshold <= 1.0:
+            raise ValueError(
+                "speaker thresholds must satisfy "
+                "0 <= new_speaker_threshold <= match_threshold <= 1"
+            )
+        if not 0.0 <= self.identify_margin <= 1.0:
+            raise ValueError("identify_margin must be within [0, 1]")
+        if not 0.0 <= self.trim_floor_ratio < 1.0:
+            raise ValueError("trim_floor_ratio must be within [0, 1)")
+        if self.min_duration_seconds <= 0:
+            raise ValueError("min_duration_seconds must be positive")
+        if self.window_seconds <= 0 or self.hop_seconds <= 0:
+            raise ValueError("window_seconds and hop_seconds must be positive")
+        if self.max_speakers < 1:
+            raise ValueError("max_speakers must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -240,6 +309,7 @@ class AppConfig:
     summary_config_path: Path = DEFAULT_SUMMARY_CONFIG_PATH
     speexdsp_lib_path: Path | None = None
     kws: KWSConfig = field(default_factory=KWSConfig)
+    speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     sensitive_words_file: Path = Path("config/sensitive_words.txt")
     hotwords_file: Path = Path("config/hotwords.txt")
     hotwords_score: float = 1.5

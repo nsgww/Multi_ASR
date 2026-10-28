@@ -20,6 +20,10 @@ def config_ok_message(lane_id: int) -> dict[str, Any]:
 
 
 def transcript_message(event: ASREvent) -> dict[str, Any]:
+    segment: dict[str, Any] = {"text": event.text}
+    # 声纹关闭时不带 speaker 字段，保持与改动前一致的报文形状
+    if event.speaker is not None:
+        segment["speaker"] = event.speaker.to_payload()
     return {
         "type": "transcript",
         "lane_id": event.stream_id,
@@ -27,10 +31,21 @@ def transcript_message(event: ASREvent) -> dict[str, Any]:
         "revision": event.revision,
         "is_partial": event.status is EventStatus.PARTIAL,
         "is_final": event.is_final,
-        "segment": {
-            "text": event.text,
-        },
+        "segment": segment,
         "timestamp_ms": event.timestamp_ms,
+    }
+
+
+def speaker_remap_message(mapping: dict[str, str], *, lane_id: int) -> dict[str, Any]:
+    """会话末二遍重聚类结果：``旧标签 -> 新标签``。
+
+    前端必须**原子地**套用整张表，不能链式逐条替换（``S1->S2`` 与
+    ``S2->S1`` 互换时会互相覆盖）。
+    """
+    return {
+        "type": "speaker_remap",
+        "lane_id": lane_id,
+        "mapping": dict(mapping),
     }
 
 

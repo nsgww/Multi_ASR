@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import time
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 
 from multi_stream_asr.asr.hotwords import load_hotwords
 from multi_stream_asr.asr.kws.keywords_tool import (
+    find_invalid_keyword_tokens,
     keywords_file_to_words,
     words_to_keywords_lines,
     write_word_list,
@@ -25,7 +27,7 @@ from multi_stream_asr.asr.summary.summary_server import SummaryServerManager
 from multi_stream_asr.asr.text_filter import SensitiveWordFilter
 from multi_stream_asr.config import AppConfig
 from multi_stream_asr.pipeline.state import PipelineState
-from multi_stream_asr.session.manager import SessionManager
+from multi_stream_asr.session.process_pool import ProcessPoolSessionManager
 from multi_stream_asr.audio.multicast import (
     DEFAULT_MULTICAST_GROUP,
     DEFAULT_MULTICAST_PORT,
@@ -40,7 +42,9 @@ from multi_stream_asr.web.wakeup_gate import WakeupSettings
 
 _logger = logging.getLogger(__name__)
 
-SessionManagerFactory = Callable[[AppConfig, FrontendEventBus], SessionManager]
+SessionManagerFactory = Callable[
+    [AppConfig, FrontendEventBus], ProcessPoolSessionManager
+]
 
 
 class SummaryRequest(BaseModel):
@@ -62,6 +66,32 @@ class WordListRequest(BaseModel):
     words: list[str]
 
 
+class MulticastStartRequest(BaseModel):
+    """新增一路组播转写。"""
+
+    group: str
+    port: int = 6020
+    local_ip: str = "0.0.0.0"
+    packet_bytes: int = 1280
+    use_full_packet: bool = False
+    # sm-sdk relay 默认 5s CMD_B 心跳唤醒硬件组播源
+    heartbeat_interval: float = 5.0
+
+
+class MulticastStopRequest(BaseModel):
+    group: str
+    port: int = 6020
+
+
+class MulticastModifyRequest(BaseModel):
+    """修改已有组播任务的地址。new_port 省略时沿用旧端口。"""
+
+    old_group: str
+    old_port: int = 6020
+    new_group: str
+    new_port: int | None = None
+
+
 _WORD_KINDS = ("hotwords", "sensitive", "keywords")
 _MAX_WORDS = 200
 _MAX_WORD_LEN = 64
@@ -78,17 +108,18 @@ _WORD_FILE_HEADERS = {
 def _default_session_manager_factory(
     config: AppConfig,
     event_bus: FrontendEventBus,
-) -> SessionManager:
-    return SessionManager(config=config, event_bus=event_bus)
+) -> ProcessPoolSessionManager:
+    return ProcessPoolSessionManager(config=config, event_bus=event_bus)
 
 
 def _status_payload(app: FastAPI) -> dict[str, Any]:
-    manager: SessionManager = app.state.session_manager
+    manager: ProcessPoolSessionManager = app.state.session_manager
     kws_cfg = app.state.config.kws
     return {
         "state": manager.state.value,
         "active_sessions": manager.active_sessions,
         "max_sessions": app.state.config.max_concurrent_sessions,
+        "alive_lanes": manager.alive_lanes,
         "port": app.state.config.web_port,
         "kws": {
             "enabled": kws_cfg.enabled,
@@ -111,7 +142,7 @@ async def _close_websockets(event_bus: FrontendEventBus) -> None:
 def create_app(
     config: AppConfig | None = None,
     *,
-    session_manager: SessionManager | None = None,
+    session_manager: ProcessPoolSessionManager | None = None,
     session_manager_factory: SessionManagerFactory | None = None,
     event_bus: FrontendEventBus | None = None,
     summary_config: SummaryConfig | None = None,
@@ -121,7 +152,11 @@ def create_app(
     bus = event_bus or FrontendEventBus()
     factory = session_manager_factory or _default_session_manager_factory
     manager = session_manager or factory(app_config, bus)
-    multicast_runtime = MulticastRuntimeRegistry(manager)
+    multicast_runtime = MulticastRuntimeRegistry(
+        manager,
+        max_jobs=app_config.max_concurrent_sessions,
+        persist_path=app_config.output_dir / "multicast_jobs.json",
+    )
     summary_cfg = summary_config or load_summary_config(app_config.summary_config_path)
     sensitive_filter = SensitiveWordFilter.from_file(app_config.sensitive_words_file)
 
@@ -130,6 +165,14 @@ def create_app(
         app.state.broadcast_task = asyncio.create_task(bus.broadcast_loop())
         try:
             await manager.load_models()
+            # 重启后自动拉起上次在跑的组播任务（清单由 registry 持久化维护）
+            await multicast_runtime.restore_jobs(
+                local_ip="0.0.0.0",
+                packet_bytes=1280,
+                use_full_packet=False,
+                heartbeat_interval=5.0,
+                speexdsp_lib_path=app_config.speexdsp_lib_path,
+            )
             if summary_cfg.enabled and summary_cfg.provider == "llama" and summary_cfg.auto_start:
                 if summary_server_manager is None:
                     app.state.summary_server_manager = SummaryServerManager(summary_cfg)
@@ -259,6 +302,19 @@ def create_app(
     async def _apply_keywords_lines(lines: list[str]) -> dict[str, Any]:
         """keywords 专用：写 token 化词表并重建 KWS，失败回滚。lines 已是 token 格式。"""
         path = _words_file_for("keywords")
+        # sherpa 遇到 tokens.txt 里不存在的 token 会在 C++ 层直接 abort（杀掉
+        # lane 进程），写文件前先校验，非法词表直接 400 拒绝。
+        invalid = find_invalid_keyword_tokens(
+            lines, Path(app_config.kws.model_dir) / "tokens.txt"
+        )
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "唤醒词含 KWS 词表外的 token（会崩溃识别进程，已拒绝）："
+                    + "; ".join(f"{line!r} 缺 {missing}" for line, missing in invalid.items())
+                ),
+            )
         old_text = path.read_text(encoding="utf-8") if path.is_file() else None
         backup = _backup_word_file(path)
         # 注意：sherpa KWS 原生解析器不支持 # 注释行，keywords 文件不写注释头
@@ -440,6 +496,90 @@ def create_app(
         )
         await handler.run()
 
+    def _validate_multicast_target(group: str, port: int) -> None:
+        try:
+            addr = ipaddress.IPv4Address(group)
+        except ipaddress.AddressValueError:
+            raise HTTPException(status_code=400, detail=f"非法组播地址: {group!r}") from None
+        if not addr.is_multicast:
+            raise HTTPException(
+                status_code=400, detail=f"{group} 不是组播地址（需在 224.0.0.0/4 内）"
+            )
+        if not (1 <= port <= 65535):
+            raise HTTPException(status_code=400, detail=f"非法端口: {port}")
+
+    @app.get("/v1/multicast")
+    async def list_multicast() -> dict[str, Any]:
+        return {
+            "jobs": multicast_runtime.list_jobs(),
+            "max_jobs": multicast_runtime.max_jobs,
+        }
+
+    @app.post("/v1/multicast/start")
+    async def start_multicast(request: MulticastStartRequest) -> dict[str, Any]:
+        """新增一路组播转写：自动从会话池分配一路 lane，无需挂 WS。"""
+        _validate_multicast_target(request.group, request.port)
+        try:
+            job = await multicast_runtime.start_job(
+                group=request.group,
+                port=request.port,
+                local_ip=request.local_ip,
+                packet_bytes=request.packet_bytes,
+                use_full_packet=request.use_full_packet,
+                heartbeat_interval=request.heartbeat_interval,
+                speexdsp_lib_path=app_config.speexdsp_lib_path,
+                listener=None,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        return {
+            "ok": True,
+            "group": request.group,
+            "port": request.port,
+            "lane_id": job.session.lane_id,
+            "note": "收听转写结果：WS 连 /ws/multicast?group=...&port=...",
+        }
+
+    @app.post("/v1/multicast/stop")
+    async def stop_multicast(request: MulticastStopRequest) -> dict[str, Any]:
+        job = await multicast_runtime.stop_job(request.group, request.port)
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"组播任务不存在: {request.group}:{request.port}",
+            )
+        return {"ok": True, "group": request.group, "port": request.port}
+
+    @app.post("/v1/multicast/modify")
+    async def modify_multicast(request: MulticastModifyRequest) -> dict[str, Any]:
+        """修改已有任务的组播地址：沿用旧任务接收参数，停旧开新。"""
+        new_port = request.new_port if request.new_port is not None else request.old_port
+        _validate_multicast_target(request.new_group, new_port)
+        try:
+            job = await multicast_runtime.modify_job(
+                old_group=request.old_group,
+                old_port=request.old_port,
+                new_group=request.new_group,
+                new_port=new_port,
+                speexdsp_lib_path=app_config.speexdsp_lib_path,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"组播任务不存在: {request.old_group}:{request.old_port}",
+            )
+        return {
+            "ok": True,
+            "old_group": request.old_group,
+            "old_port": request.old_port,
+            "group": request.new_group,
+            "port": new_port,
+            "lane_id": job.session.lane_id,
+            "note": "原收听连接已断开，请用新地址重新收听",
+        }
+
     @app.websocket("/ws/multicast")
     async def websocket_multicast(websocket: WebSocket) -> None:
         params = websocket.query_params
@@ -463,43 +603,46 @@ def create_app(
         )
         await handler.run()
 
-    @app.websocket("/ws/local_mic")
-    async def websocket_local_mic(websocket: WebSocket) -> None:
-        params = websocket.query_params
-        try:
-            sample_rate = int(params.get("sample_rate", "16000"))
-        except ValueError:
-            sample_rate = 16000
-        if sample_rate <= 0:
-            sample_rate = 16000
-        device_raw = params.get("device")
-        if device_raw is None:
-            device: int | str | None = None
-        else:
-            try:
-                device = int(device_raw)
-            except ValueError:
-                device = device_raw
-        try:
-            chunk = int(params.get("chunk", "512"))
-        except ValueError:
-            chunk = 512
-        if chunk <= 0:
-            chunk = 512
-        wakeup_enabled = params.get("wakeup", "true").lower() not in ("0", "false", "no")
-        handler = LocalMicHandler(
-            websocket=websocket,
-            session_manager=manager,
-            summary_config=summary_cfg,
-            output_dir=app_config.output_dir,
-            device=device,
-            sample_rate=sample_rate,
-            chunk=chunk,
-            wakeup_enabled=wakeup_enabled,
-            sensitive_filter=sensitive_filter,
-            wakeup_settings=wakeup_settings,
-        )
-        await handler.run()
+    # 2026-10-28 起暂时停用本机麦克风入口（多设备抢板载 mic 会互相干扰）；
+    # 恢复时取消下面这段的注释即可。
+    # @app.websocket("/ws/local_mic")
+    # async def websocket_local_mic(websocket: WebSocket) -> None:
+    #     params = websocket.query_params
+    #     try:
+    #         sample_rate = int(params.get("sample_rate", "16000"))
+    #     except ValueError:
+    #         sample_rate = 16000
+    #     if sample_rate <= 0:
+    #         sample_rate = 16000
+    #     device_raw = params.get("device")
+    #     if device_raw is None:
+    #         device: int | str | None = None
+    #     else:
+    #         try:
+    #             device = int(device_raw)
+    #         except ValueError:
+    #             device = device_raw
+    #     try:
+    #         chunk = int(params.get("chunk", "512"))
+    #     except ValueError:
+    #         chunk = 512
+    #     if chunk <= 0:
+    #         chunk = 512
+    #     wakeup_enabled = params.get("wakeup", "true").lower() not in ("0", "false", "no")
+    #     handler = LocalMicHandler(
+    #         websocket=websocket,
+    #         session_manager=manager,
+    #         summary_config=summary_cfg,
+    #         output_dir=app_config.output_dir,
+    #         device=device,
+    #         sample_rate=sample_rate,
+    #         chunk=chunk,
+    #         wakeup_enabled=wakeup_enabled,
+    #         sensitive_filter=sensitive_filter,
+    #         wakeup_settings=wakeup_settings,
+    #     )
+    #     await handler.run()
+    _ = LocalMicHandler  # 保留 import，路由恢复时直接用
 
     @app.post("/v1/audio/transcriptions")
     async def audio_transcriptions(

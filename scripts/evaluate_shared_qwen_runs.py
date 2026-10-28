@@ -150,7 +150,7 @@ def render_markdown(result: dict[str, Any]) -> str:
         "",
         "## 拓扑",
         "",
-        "1 个主 Python 进程、4 个 lane Python 子进程、1 个 llama-multi-asr。",
+        "1 个主 Python 进程、4 个 lane Python 子进程、1 个 llama-server。",
         "",
         "## 性能结论",
         "",

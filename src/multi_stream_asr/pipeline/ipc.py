@@ -5,7 +5,14 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from multi_stream_asr.models import ASREvent, EventStatus, LaneFinalState, LaneMetrics, ResultType
+from multi_stream_asr.models import (
+    ASREvent,
+    EventStatus,
+    LaneFinalState,
+    LaneMetrics,
+    ResultType,
+    SpeakerInfo,
+)
 
 
 LaneMessageType = str
@@ -99,10 +106,12 @@ def asr_event_to_payload(event: ASREvent) -> dict[str, Any]:
         "is_final": event.is_final,
         "text": event.text,
         "timestamp_ms": event.timestamp_ms,
+        "speaker": event.speaker.to_payload() if event.speaker is not None else None,
     }
 
 
 def asr_event_from_payload(payload: dict[str, Any]) -> ASREvent:
+    speaker_payload = payload.get("speaker")
     return ASREvent(
         event_type=str(payload["event_type"]),
         stream_id=int(payload["stream_id"]),
@@ -113,6 +122,11 @@ def asr_event_from_payload(payload: dict[str, Any]) -> ASREvent:
         is_final=bool(payload["is_final"]),
         text=str(payload.get("text", "")),
         timestamp_ms=int(payload["timestamp_ms"]),
+        speaker=(
+            SpeakerInfo.from_payload(speaker_payload)
+            if isinstance(speaker_payload, dict)
+            else None
+        ),
     )
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import queue
 import time
 import traceback
@@ -12,6 +13,8 @@ from typing import Any
 
 import numpy as np
 
+from multi_stream_asr.asr.kws.sherpa_kws import SherpaKeywordSpotter
+from multi_stream_asr.asr.kws.keywords_tool import find_invalid_keyword_tokens
 from multi_stream_asr.asr.offline.base import OfflineRecognitionResult
 from multi_stream_asr.asr.offline.qwen3asr import Qwen3AsrClient
 from multi_stream_asr.asr.hotwords import load_hotwords, resolve_sherpa_hotwords
@@ -46,6 +49,14 @@ from multi_stream_asr.models import (
 from multi_stream_asr.pipeline.ipc import asr_event_to_payload, lane_metrics_to_payload, make_message
 from multi_stream_asr.pipeline.pipeline import LanePipeline
 from multi_stream_asr.pipeline.online_worker import OnlineConsumerWorker
+from multi_stream_asr.speaker import (
+    SherpaSpeakerEmbedder,
+    SpeakerTracker,
+    VoiceprintRegistry,
+    verify_speaker_model,
+)
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -204,6 +215,8 @@ class LaneRuntime:
         self._artifacts_created = False
         self._offline_closed = False
         self._lane_stopped_sent = False
+        self._kws_spotter: SherpaKeywordSpotter | None = None
+        self._speaker_registry: VoiceprintRegistry | None = None
         self._latency_tracker = LatencyTracker()
         self._rtf_tracker = RtfTracker()
         self._shared_timings_tracker = SharedTimingsTracker()
@@ -305,8 +318,17 @@ class LaneRuntime:
                 shared=self.app_config.shared_qwen,
                 hotwords=tuple(hotwords),
             )
+            await self._load_kws()
+            self._load_speaker()
 
-        self.send("lifecycle", {"state": "lane_model_loaded", "message": ""})
+        self.send(
+            "lifecycle",
+            {
+                "state": "lane_model_loaded",
+                "message": "",
+                "kws_loaded": self._kws_spotter is not None,
+            },
+        )
         command = await self._wait_for_command({"warmup", "stop", "shutdown"})
         if command["type"] != "warmup":
             return command
@@ -329,6 +351,121 @@ class LaneRuntime:
 
         self.send("lifecycle", {"state": "lane_loaded", "message": ""})
         return None
+
+    async def _load_kws(self) -> None:
+        """每 lane 子进程独立加载 KWS（模型 3.3M，开销可忽略）；失败仅告警。"""
+        kws_cfg = self.app_config.kws
+        if not kws_cfg.enabled:
+            _logger.info("KWS disabled by config (lane=%d)", self.lane.stream_id)
+            return
+        spotter = SherpaKeywordSpotter(
+            model_dir=kws_cfg.model_dir,
+            keywords_file=kws_cfg.keywords_file,
+            sample_rate=kws_cfg.sample_rate,
+            num_threads=kws_cfg.num_threads,
+            max_active_paths=kws_cfg.max_active_paths,
+            keywords_score=kws_cfg.keywords_score,
+            keywords_threshold=kws_cfg.keywords_threshold,
+            num_trailing_blanks=kws_cfg.num_trailing_blanks,
+            provider=kws_cfg.provider,
+            repeat_interval=kws_cfg.repeat_interval,
+        )
+        try:
+            await asyncio.to_thread(spotter.load)
+        except Exception:
+            _logger.exception(
+                "KWS load failed (lane=%d model_dir=%s); continuing without KWS",
+                self.lane.stream_id,
+                kws_cfg.model_dir,
+            )
+            return
+        self._kws_spotter = spotter
+
+    def _load_speaker(self) -> None:
+        """声纹库 + 子进程预检；embedder 本身在每次 run 的 tracker 里懒加载。"""
+        cfg = self.app_config.speaker
+        if not cfg.enabled:
+            return
+        model_path = Path(cfg.model_path)
+        if not model_path.is_file():
+            _logger.warning(
+                "声纹模型不存在，本 lane 关闭声纹: %s (lane=%d)",
+                model_path,
+                self.lane.stream_id,
+            )
+            return
+        registry_dir = cfg.registry_dir or (self.app_config.output_dir / "voiceprints")
+        # 坏模型（常见是缺 model_type 元数据）会让 sherpa-onnx 段错误，
+        # 必须在子进程外预检后再上线。
+        verdict = verify_speaker_model(model_path)
+        if not verdict.ok:
+            _logger.error(
+                "声纹模型预检失败，本 lane 关闭声纹: %s —— %s",
+                model_path,
+                verdict.detail,
+            )
+            return
+        self._speaker_registry = VoiceprintRegistry(registry_dir)
+
+    def _create_speaker_tracker(self) -> SpeakerTracker | None:
+        """每次 run 新建一个 tracker（每 lane 一份 embedder，约 28MB）。"""
+        cfg = self.app_config.speaker
+        if self.process_config.fake or not cfg.enabled or self._speaker_registry is None:
+            return None
+        embedder = SherpaSpeakerEmbedder(
+            model_path=Path(cfg.model_path),
+            num_threads=cfg.num_threads,
+            provider=cfg.provider,
+            sample_rate=cfg.sample_rate,
+            window_seconds=cfg.window_seconds,
+            hop_seconds=cfg.hop_seconds,
+            trim_floor_ratio=cfg.trim_floor_ratio,
+        )
+        return SpeakerTracker(
+            embedder=embedder,
+            config=cfg,
+            registry=self._speaker_registry,
+            stream_id=self.lane.stream_id,
+        )
+
+    def _apply_set_hotwords(self, command: dict[str, Any]) -> None:
+        words = tuple(str(w) for w in command.get("words", ()))
+        if self._offline_recognizer is not None:
+            self._offline_recognizer.set_hotwords(words)
+        _logger.info(
+            "lane %d hotwords updated at runtime: %d entries",
+            self.lane.stream_id,
+            len(words),
+        )
+
+    def _apply_reload_kws(self) -> None:
+        if self._kws_spotter is None:
+            _logger.warning("reload_kws ignored: KWS not loaded (lane=%d)", self.lane.stream_id)
+            return
+        # sherpa 遇到未知 token 会在 C++ 层直接终止进程（Encode keywords
+        # failed → abort），reload 前先在 Python 侧校验，非法词表保持旧词不动。
+        kws_cfg = self.app_config.kws
+        try:
+            lines = [
+                ln.strip()
+                for ln in Path(kws_cfg.keywords_file).read_text(encoding="utf-8").splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+            invalid = find_invalid_keyword_tokens(lines, Path(kws_cfg.model_dir) / "tokens.txt")
+        except Exception:
+            _logger.exception("KWS keywords 校验失败，跳过重载 (lane=%d)", self.lane.stream_id)
+            return
+        if invalid:
+            _logger.error(
+                "KWS keywords 含未知 token，跳过重载 (lane=%d): %s",
+                self.lane.stream_id,
+                invalid,
+            )
+            return
+        try:
+            self._kws_spotter.reload()
+        except Exception:
+            _logger.exception("KWS reload failed (lane=%d)", self.lane.stream_id)
 
     async def _run_started(self, command: dict[str, Any]) -> None:
         self._reset_for_run()
@@ -355,6 +492,13 @@ class LaneRuntime:
                     "request": failure.request,
                 },
             )
+
+        def report_kws(result: Any) -> None:
+            self.send("kws_event", {"keyword": result.keyword})
+
+        def report_speaker(payload: dict[str, Any]) -> None:
+            mapping = payload.get("mapping") if isinstance(payload, dict) else None
+            self.send("speaker_remap", {"mapping": mapping})
 
         result_writer: LaneResultWriter | None = None
         model_output_recorder: LaneModelOutputJsonlRecorder | None = None
@@ -411,6 +555,14 @@ class LaneRuntime:
                 ),
                 on_qwen_success=report_qwen_success,
                 on_qwen_error=report_qwen_error,
+                kws_session=(
+                    self._kws_spotter.create_session()
+                    if self._kws_spotter is not None
+                    else None
+                ),
+                on_kws=report_kws,
+                speaker_tracker=self._create_speaker_tracker(),
+                on_speaker=report_speaker,
             )
             self._runtime_stop_requested = False
             source_ready = asyncio.Event()
@@ -634,6 +786,8 @@ class LaneRuntime:
                 stream_id=self.lane.stream_id,
                 audio_queue=self.audio_queue,
                 frame_duration_ms=self.app_config.frame_duration_ms,
+                input_sample_rate=int(command.get("input_sample_rate", 16000)),
+                speexdsp_lib_path=self.app_config.speexdsp_lib_path,
             )
         input_kind = command.get("input_kind", "local_wav")
         if input_kind == "microphone":
@@ -667,6 +821,12 @@ class LaneRuntime:
             except queue.Empty:
                 continue
             command_type = str(command.get("type", ""))
+            if command_type == "set_hotwords":
+                self._apply_set_hotwords(command)
+                continue
+            if command_type == "reload_kws":
+                self._apply_reload_kws()
+                continue
             if command_type in allowed:
                 return dict(command)
 
@@ -678,6 +838,12 @@ class LaneRuntime:
                 await asyncio.sleep(0.01)
                 continue
             command_type = str(command.get("type", ""))
+            if command_type == "set_hotwords":
+                self._apply_set_hotwords(command)
+                continue
+            if command_type == "reload_kws":
+                self._apply_reload_kws()
+                continue
             if command_type not in {"stop", "shutdown"}:
                 continue
             reason = str(command.get("reason", ""))

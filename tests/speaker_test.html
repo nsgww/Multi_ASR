@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>说话人分离/声纹识别 最小测试</title>
+<style>
+  body { font-family: sans-serif; max-width: 760px; margin: 20px auto; padding: 0 12px; }
+  .row { margin: 8px 0; }
+  input { padding: 4px 6px; }
+  button { padding: 6px 14px; margin-right: 8px; }
+  #log { border: 1px solid #ccc; border-radius: 6px; min-height: 300px;
+         padding: 10px; margin-top: 12px; white-space: pre-wrap; line-height: 1.7; }
+  #partial { color: #999; }
+  .spk { display: inline-block; min-width: 34px; font-weight: bold; }
+  .S1 { color: #1a6fd4; } .S2 { color: #d44a1a; } .S3 { color: #1a9c4d; }
+  .S4 { color: #9c1a8f; } .S5 { color: #b58900; } .S6 { color: #00838f; }
+  #status { font-size: 13px; color: #666; }
+</style>
+</head>
+<body>
+<h3>说话人分离 / 声纹识别 测试</h3>
+
+<div class="row">
+  服务器 <input id="server" value="ws://192.168.1.179:8000" size="26">
+</div>
+<div class="row">
+  音源：
+  <label><input type="radio" name="src" value="mic" checked> 本机麦克风</label>
+  <label><input type="radio" name="src" value="mcast"> 组播</label>
+  <input id="group" value="224.2.1.168" size="12" title="组播组">
+  <input id="port" value="6020" size="5" title="端口">
+</div>
+
+<fieldset style="margin:10px 0; border:1px solid #ccc; border-radius:6px;">
+  <legend>组播管理（REST，无需挂页面；重启服务自动恢复）</legend>
+  <div class="row">
+    组 <input id="mcGroup" value="224.2.110.220" size="13" list="mcAddrBook">
+    <datalist id="mcAddrBook"></datalist>
+    端口 <input id="mcPort" value="6020" size="5">
+    <button id="btnMcStart">开启组播</button>
+    <button id="btnMcList">刷新列表</button>
+  </div>
+  <div id="mcList" style="font-size:13px; line-height:1.8;">（未查询）</div>
+</fieldset>
+
+<div class="row">
+  <button id="btnStart">开始转写</button>
+  <button id="btnStop" disabled>结束</button>
+  <span id="status">未连接</span>
+</div>
+
+<div id="log"><div id="partial"></div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let ws = null, audioCtx = null, mediaStream = null, processor = null;
+let finals = [];   // {el, spkId}
+let spkMap = {};   // speaker_remap: oldId -> newId
+const mcSockets = {};   // "group:port" -> WebSocket（多路同时收听）
+const MC_COLORS = ['#1a6fd4','#d44a1a','#1a9c4d','#9c1a8f','#b58900','#00838f','#666','#a05'];
+function mcColor(key) {
+  let h = 0; for (const c of key) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return MC_COLORS[h % MC_COLORS.length];
+}
+function mcTag(key) {
+  const short = key.split(':')[0].split('.').slice(-2).join('.') + ':' + key.split(':')[1];
+  return `<span style="color:${mcColor(key)};font-weight:bold">[${short}]</span> `;
+}
+
+function setStatus(s) { $('status').textContent = s; }
+
+function spkHtml(spk) {
+  if (!spk) return '';
+  const label = spk.name ? `${spk.label}(${spk.name})` : spk.label;
+  return `<span class="spk ${spk.label}">[${label}]</span>`;
+}
+
+function addFinal(sid, spk, text, tag) {
+  const div = document.createElement('div');
+  if (tag) div.innerHTML = tag;
+  div.innerHTML += spkHtml(spk);
+  div.appendChild(document.createTextNode(text));
+  const rec = { el: div, spkId: spk && spk.id, tag };
+  finals.push(rec);
+  $('log').insertBefore(div, $('partial'));
+}
+
+function applyRemap(mapping, tag) {
+  // mapping: { spk_1: "spk_2", ... } 二遍重聚类后的标签修正；只作用于同一路的记录
+  for (const rec of finals) {
+    if (rec.tag !== tag) continue;
+    if (rec.spkId && mapping[rec.spkId]) {
+      const newId = mapping[rec.spkId];
+      rec.spkId = newId;
+      const n = parseInt(newId.replace('spk_', ''), 10);
+      const span = rec.el.querySelector('.spk');
+      if (span && n) {
+        span.textContent = `[S${n}]`;
+        span.className = `spk S${n}`;
+      }
+    }
+  }
+}
+
+function handleMsg(msg, tag) {
+  const tagText = tag ? tag.replace(/<[^>]+>/g, '') + ' ' : '';
+  if (msg.type === 'transcript') {
+    const seg = msg.segment || {};
+    if (msg.is_partial) {
+      $('partial').textContent = tagText + (seg.text || '');
+    } else if (msg.is_final) {
+      $('partial').textContent = '';
+      addFinal(msg.sentence_id, seg.speaker, seg.text || '', tag);
+    }
+  } else if (msg.type === 'speaker_remap') {
+    applyRemap(msg.mapping || {}, tag);
+  } else if (msg.type === 'status') {
+    setStatus(tagText + msg.status + (msg.message ? '：' + msg.message : ''));
+  } else if (msg.type === 'error') {
+    setStatus(tagText + '错误：' + msg.message);
+  }
+}
+
+// 麦克风：采集 → 降采样到 16k 单声道 PCM16 → 二进制发送
+async function startMic() {
+  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = audioCtx.createMediaStreamSource(mediaStream);
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  const ratio = audioCtx.sampleRate / 16000;
+  processor.onaudioprocess = e => {
+    if (!ws || ws.readyState !== 1) return;
+    const input = e.inputBuffer.getChannelData(0);
+    const outLen = Math.floor(input.length / ratio);
+    const pcm = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const s = Math.max(-1, Math.min(1, input[Math.floor(i * ratio)]));
+      pcm[i] = s * 32767;
+    }
+    ws.send(pcm.buffer);
+  };
+  src.connect(processor);
+  processor.connect(audioCtx.destination);
+}
+
+async function start() {
+  const server = $('server').value.replace(/\/$/, '');
+  const useMic = document.querySelector('input[name=src]:checked').value === 'mic';
+  const url = useMic
+    ? `${server}/ws/stream?sample_rate=16000&wakeup=false`
+    : `${server}/ws/multicast?group=${encodeURIComponent($('group').value)}&port=${$('port').value}&wakeup=false`;
+
+  ws = new WebSocket(url);
+  ws.onopen = async () => {
+    if (useMic) {
+      try { await startMic(); }
+      catch (e) { setStatus('麦克风打开失败：' + e.message); ws.close(); return; }
+    }
+    ws.send(JSON.stringify({ type: 'start' }));
+    setStatus('已开始');
+    $('btnStart').disabled = true;
+    $('btnStop').disabled = false;
+  };
+  ws.onmessage = e => handleMsg(JSON.parse(e.data));
+  ws.onclose = () => { setStatus('连接已断开'); stop(true); };
+  ws.onerror = () => setStatus('连接错误');
+}
+
+function stop(fromClose) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'finish' }));
+  if (!fromClose && ws) ws.close();
+  ws = null;
+  if (processor) { processor.disconnect(); processor = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  $('btnStart').disabled = false;
+  $('btnStop').disabled = true;
+}
+
+$('btnStart').onclick = start;
+$('btnStop').onclick = () => stop(false);
+
+// ---------- 组播管理（REST） ----------
+function httpBase() { return $('server').value.replace(/\/$/, '').replace(/^ws/, 'http'); }
+
+// 常用地址簿（存在浏览器 localStorage，下拉记忆输过的组地址）
+const MC_ADDR_KEY = 'mcAddrBook';
+function mcAddrBookLoad() {
+  try { return JSON.parse(localStorage.getItem(MC_ADDR_KEY) || '[]'); } catch { return []; }
+}
+function mcAddrBookRender() {
+  $('mcAddrBook').innerHTML = mcAddrBookLoad().map(a => `<option value="${a}">`).join('');
+}
+function mcAddrBookAdd(group) {
+  const list = mcAddrBookLoad().filter(a => a !== group);
+  list.unshift(group);
+  localStorage.setItem(MC_ADDR_KEY, JSON.stringify(list.slice(0, 20)));
+  mcAddrBookRender();
+}
+
+async function mcStart() {
+  const r = await fetch(`${httpBase()}/v1/multicast/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ group: $('mcGroup').value.trim(), port: +$('mcPort').value }),
+  });
+  const d = await r.json();
+  if (!r.ok) { setStatus('开启失败：' + (d.detail || r.status)); return; }
+  mcAddrBookAdd($('mcGroup').value.trim());
+  setStatus(`组播已开启 lane=${d.lane_id}（点列表里的「收听」看实时结果）`);
+  mcList();
+}
+
+async function mcModify(group, port) {
+  const input = prompt(`把 ${group}:${port} 改为（格式：组播地址 或 组播地址:端口）`, group);
+  if (!input) return;
+  const parts = input.trim().split(':');
+  const body = { old_group: group, old_port: port, new_group: parts[0] };
+  if (parts.length > 1 && parts[1]) body.new_port = +parts[1];
+  const key = `${group}:${port}`;
+  if (mcSockets[key]) { mcSockets[key].close(); delete mcSockets[key]; }
+  const r = await fetch(`${httpBase()}/v1/multicast/modify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const d = await r.json();
+  if (!r.ok) { setStatus('修改失败：' + (d.detail || r.status)); return; }
+  mcAddrBookAdd(d.group);
+  setStatus(`已改为 ${d.group}:${d.port} lane=${d.lane_id}（原收听已断开，请重新收听）`);
+  mcList();
+}
+
+async function mcStop(group, port) {
+  const key = `${group}:${port}`;
+  if (mcSockets[key]) { mcSockets[key].close(); delete mcSockets[key]; }
+  const r = await fetch(`${httpBase()}/v1/multicast/stop`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ group, port }),
+  });
+  const d = await r.json();
+  if (!r.ok) { setStatus('停止失败：' + (d.detail || r.status)); return; }
+  setStatus(`已停止 ${group}:${port}`);
+  mcList();
+}
+
+async function mcList() {
+  try {
+    const r = await fetch(`${httpBase()}/v1/multicast`);
+    const d = await r.json();
+    if (!d.jobs.length) { $('mcList').textContent = `（无运行中的组播，上限 ${d.max_jobs} 路）`; return; }
+    $('mcList').innerHTML = d.jobs.map(j =>
+      `<div>${mcTag(j.group + ':' + j.port)}<b>${j.group}:${j.port}</b> lane=${j.lane_id} 收包=${j.packets_received} 帧=${j.frames_emitted} ` +
+      `<button onclick="mcListen('${j.group}',${j.port})">${mcSockets[j.group + ':' + j.port] ? '停止收听' : '收听'}</button> ` +
+      `<button onclick="mcModify('${j.group}',${j.port})">修改</button> ` +
+      `<button onclick="mcStop('${j.group}',${j.port})">停止</button></div>`
+    ).join('') + `<div style="color:#888">上限 ${d.max_jobs} 路</div>`;
+  } catch (e) { $('mcList').textContent = '查询失败：' + e.message; }
+}
+
+function mcListen(group, port) {
+  const key = `${group}:${port}`;
+  if (mcSockets[key]) {  // 再点一次 = 停止收听（只断开收听，组播任务照跑）
+    mcSockets[key].close();
+    delete mcSockets[key];
+    mcList();
+    return;
+  }
+  const server = $('server').value.replace(/\/$/, '');
+  const sock = new WebSocket(
+    `${server}/ws/multicast?group=${encodeURIComponent(group)}&port=${port}&wakeup=false`
+  );
+  const tag = mcTag(key);
+  sock.onopen = () => { sock.send(JSON.stringify({ type: 'start' })); mcList(); };
+  sock.onmessage = e => handleMsg(JSON.parse(e.data), tag);
+  sock.onclose = () => { delete mcSockets[key]; mcList(); };
+  sock.onerror = () => setStatus(tag.replace(/<[^>]+>/g, '') + ' 收听连接错误');
+  mcSockets[key] = sock;
+}
+
+$('btnMcStart').onclick = mcStart;
+$('btnMcList').onclick = mcList;
+mcAddrBookRender();
+mcList();
+</script>
+</body>
+</html>

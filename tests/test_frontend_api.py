@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from multi_stream_asr.asr.summary.config import SummaryConfig
 from multi_stream_asr.config import AppConfig, ModelConfig
 from multi_stream_asr.models import ASREvent, EventStatus, ResultType
-from multi_stream_asr.session.manager import Session, SessionManager
+from multi_stream_asr.session.process_pool import ProcessPoolSessionManager, Session
 from multi_stream_asr.web.event_bus import FrontendEventBus
 from multi_stream_asr.web.server import create_app
 
@@ -54,12 +54,14 @@ class FakeLaneProcessController:
         self._alive = False
 
 
-class FakeSessionManager(SessionManager):
+class FakeSessionManager(ProcessPoolSessionManager):
     def __init__(self, config: AppConfig, event_bus: FrontendEventBus) -> None:
         self._config = config
         self._event_bus = event_bus
         self._state = "loaded"
         self._sessions: dict[int, Session] = {}
+        self._controllers: dict[int, Any] = {}
+        self._kws_loaded = False
         self._next_lane = 0
         self.calls: list[str] = []
 
@@ -78,7 +80,7 @@ class FakeSessionManager(SessionManager):
     async def unload_models(self) -> None:
         self.calls.append("unload_models")
 
-    async def create_session(self, on_event) -> Session:
+    async def create_session(self, on_event, *, input_sample_rate: int = 16000) -> Session:
         lane_id = self._next_lane
         self._next_lane += 1
         controller = FakeLaneProcessController()

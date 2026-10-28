@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from multi_stream_asr.audio.multicast import MulticastAudioSource
-from multi_stream_asr.session.manager import Session, SessionManager
+from multi_stream_asr.session.process_pool import ProcessPoolSessionManager, Session
 
 _logger = logging.getLogger(__name__)
 
@@ -42,13 +45,41 @@ class MulticastJob:
 class MulticastRuntimeRegistry:
     """Keeps multicast jobs alive across WebSocket disconnect/reconnect."""
 
-    def __init__(self, session_manager: SessionManager) -> None:
+    def __init__(
+        self,
+        session_manager: ProcessPoolSessionManager,
+        *,
+        max_jobs: int = 8,
+        persist_path: Path | None = None,
+    ) -> None:
         self._session_manager = session_manager
+        self._max_jobs = max_jobs
+        self._persist_path = persist_path
         self._jobs: dict[tuple[str, int], MulticastJob] = {}
         self._lock = asyncio.Lock()
 
+    @property
+    def max_jobs(self) -> int:
+        return self._max_jobs
+
     def get(self, group: str, port: int) -> MulticastJob | None:
         return self._jobs.get((group, port))
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        """当前在跑的组播任务清单（REST 查询用）。"""
+        return [
+            {
+                "group": group,
+                "port": port,
+                "lane_id": job.session.lane_id,
+                "listeners": len(job.listeners),
+                "finished": job.finished,
+                "packets_received": job.audio_source.packets_received,
+                "frames_emitted": job.audio_source.frames_emitted,
+                "heartbeats_sent": job.audio_source.heartbeats_sent,
+            }
+            for (group, port), job in sorted(self._jobs.items())
+        ]
 
     async def start_job(
         self,
@@ -60,13 +91,14 @@ class MulticastRuntimeRegistry:
         use_full_packet: bool,
         heartbeat_interval: float,
         speexdsp_lib_path: str | None,
-        listener: EventSink,
+        listener: EventSink | None = None,
     ) -> MulticastJob:
         key = (group, port)
         async with self._lock:
             existing = self._jobs.get(key)
             if existing is not None and not existing.finished:
-                existing.listeners.add(listener)
+                if listener is not None:
+                    existing.listeners.add(listener)
                 _logger.info(
                     "multicast job reattached %s:%d lane=%d listeners=%d",
                     group,
@@ -75,6 +107,11 @@ class MulticastRuntimeRegistry:
                     len(existing.listeners),
                 )
                 return existing
+
+            if len(self._jobs) >= self._max_jobs:
+                raise RuntimeError(
+                    f"组播路数已达上限 {self._max_jobs}，请先停止一路再新增"
+                )
 
             session = await self._session_manager.create_session(
                 on_event=lambda message, k=key: self._fanout(k, message)
@@ -110,9 +147,10 @@ class MulticastRuntimeRegistry:
                     self._stats_loop(key, group, port),
                     name=f"mcast-stats-{group}-{port}",
                 ),
-                listeners={listener},
+                listeners={listener} if listener is not None else set(),
             )
             self._jobs[key] = job
+            self._save_persisted()
             _logger.info(
                 "multicast job started %s:%d lane=%d",
                 group,
@@ -141,14 +179,18 @@ class MulticastRuntimeRegistry:
             len(job.listeners),
         )
 
-    async def stop_job(self, group: str, port: int) -> MulticastJob | None:
+    async def stop_job(
+        self, group: str, port: int, *, update_persist: bool = True
+    ) -> MulticastJob | None:
         key = (group, port)
         async with self._lock:
-            job = self._jobs.pop(key, None)
+            job = self._jobs.get(key)
             if job is None:
                 return None
             job.finished = True
-            job.listeners.clear()
+            # 注意：收尾期间不要提前摘除 job、也不要清 listeners。
+            # pipeline 在收尾时还会吐最后一句 FINAL 和 speaker_remap，而
+            # ``_fanout`` 靠 ``_jobs`` 查表投递，提前摘掉这些事件会被丢掉。
             if not job.stats_task.done():
                 job.stats_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -168,13 +210,115 @@ class MulticastRuntimeRegistry:
             except asyncio.TimeoutError:
                 _logger.warning("multicast job finish timed out %s:%d", group, port)
             await self._session_manager.stop_session(job.session)
+            # 收尾事件投递完毕，这时才摘除并断掉监听
+            if self._jobs.get(key) is job:
+                self._jobs.pop(key, None)
+            job.listeners.clear()
+            if update_persist:
+                self._save_persisted()
             _logger.info("multicast job stopped %s:%d", group, port)
             return job
 
     async def stop_all(self) -> None:
+        # 服务关停不清持久化清单：重启后要按这份清单自动拉起
         keys = list(self._jobs.keys())
         for group, port in keys:
-            await self.stop_job(group, port)
+            await self.stop_job(group, port, update_persist=False)
+
+    async def modify_job(
+        self,
+        *,
+        old_group: str,
+        old_port: int,
+        new_group: str,
+        new_port: int | None = None,
+        speexdsp_lib_path: str | None = None,
+    ) -> MulticastJob | None:
+        """修改已有任务的组播地址：沿用旧任务的接收参数，停旧开新。
+
+        返回新任务；旧任务不存在返回 None。注意旧任务上的 WS listener
+        不会迁移，客户端需用新地址重新「收听」。
+        """
+        old = self._jobs.get((old_group, old_port))
+        if old is None or old.finished:
+            return None
+        params: dict[str, Any] = {
+            "local_ip": old.audio_source.local_ip,
+            "packet_bytes": old.audio_source.packet_bytes,
+            "use_full_packet": old.audio_source.use_full_packet,
+            "heartbeat_interval": old.audio_source.heartbeat_interval,
+            "speexdsp_lib_path": speexdsp_lib_path,
+            "listener": None,
+        }
+        await self.stop_job(old_group, old_port)
+        return await self.start_job(
+            group=new_group,
+            port=new_port if new_port is not None else old_port,
+            **params,
+        )
+
+    def _save_persisted(self) -> None:
+        """把当前在跑的组播地址落盘，供服务重启后自动恢复。"""
+        if self._persist_path is None:
+            return
+        data = [
+            {"group": group, "port": port}
+            for (group, port), job in sorted(self._jobs.items())
+            if not job.finished
+        ]
+        try:
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            self._persist_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            _logger.exception("multicast persist save failed: %s", self._persist_path)
+
+    async def restore_jobs(
+        self,
+        *,
+        local_ip: str,
+        packet_bytes: int,
+        use_full_packet: bool,
+        heartbeat_interval: float,
+        speexdsp_lib_path: str | None,
+    ) -> list[tuple[str, int]]:
+        """服务启动时按持久化清单自动拉起上次的组播任务。"""
+        if self._persist_path is None or not self._persist_path.exists():
+            return []
+        try:
+            data = json.loads(self._persist_path.read_text(encoding="utf-8"))
+        except Exception:
+            _logger.exception("multicast persist load failed: %s", self._persist_path)
+            return []
+        restored: list[tuple[str, int]] = []
+        for item in data if isinstance(data, list) else []:
+            try:
+                group = str(item["group"]).strip()
+                port = int(item["port"])
+                addr = ipaddress.IPv4Address(group)
+                if not addr.is_multicast or not (1 <= port <= 65535):
+                    raise ValueError("not a valid multicast target")
+            except Exception:
+                _logger.warning("multicast persist skip invalid entry: %r", item)
+                continue
+            try:
+                await self.start_job(
+                    group=group,
+                    port=port,
+                    local_ip=local_ip,
+                    packet_bytes=packet_bytes,
+                    use_full_packet=use_full_packet,
+                    heartbeat_interval=heartbeat_interval,
+                    speexdsp_lib_path=speexdsp_lib_path,
+                    listener=None,
+                )
+                restored.append((group, port))
+            except Exception:
+                _logger.exception("multicast restore failed %s:%d", group, port)
+        if restored:
+            _logger.info("multicast restored %d job(s): %s", len(restored), restored)
+        return restored
 
     def _fanout(self, key: tuple[str, int], message: dict[str, Any]) -> None:
         job = self._jobs.get(key)

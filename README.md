@@ -38,7 +38,7 @@ cd /opt/multi-stream-asr
 scripts/setup.sh
 ```
 
-自动安装 Python 3.13、PortAudio 及硬件依赖，并下载 Zipformer 和 Qwen3-ASR 模型到 `models/asr`（校验 MD5，断网重跑自动续传）。K3/RISC-V 的 `llama-multi-asr` runtime 已内置在 `multi-asr-runtime/`，无需额外安装。
+自动安装 Python 3.13、PortAudio 及硬件依赖，并下载 Zipformer 和 Qwen3-ASR 模型到 `models/asr`（校验 MD5，断网重跑自动续传）。纠错后端使用系统 `llama-server`（`--media-backend smt`，Bianbu 镜像自带，无需额外安装）。
 
 常用参数：`--skip-apt`（系统包已装时跳过）、`--skip-python`（只装模型）、`--models-dir PATH`（自定义模型目录）。
 
@@ -226,6 +226,167 @@ Environment=LIBSPEEXDSP_PATH=/usr/local/lib/libspeexdsp.so.1
 
 Zipformer 链路走 sherpa-onnx 自带端点检测（rule1/rule2/rule3），不受以上参数影响。
 
+### 6.2 说话人分离与声纹识别
+
+**能力边界（先看清楚再开）**：这是**句级**归属，不是帧级 diarization——每句
+说话人是谁，不做"谁在 3.2 秒到 3.8 秒说话"。单通道全向麦 + 会议室的现实上限
+是 **2~4 人、轮次级、正确率约 85%**，并且必须保留"人工改名纠错"。别承诺自动
+认出 6 个人。
+
+三条输入链路（`/ws/stream`、`/ws/multicast`、`/ws/local_mic`）都已接入，共用同一
+份 transcript 缓冲与落盘渲染逻辑，报文与落盘格式完全一致。
+
+**额外模型（不自己训练，用开源 CAM++）**
+
+| 用途 | 模型 | 说明 |
+|------|------|------|
+| 声纹 embedding | 3D-Speaker **CAM++** zh-cn 16k | 192 维，约 28MB，中文最优性价比 |
+| 备选 | WeSpeaker ResNet34-LM | 更准但慢约 3 倍 |
+
+从 sherpa-onnx 的 `speaker-recongition-models` release 下载
+`3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx`（上游 tag 拼写就是
+`recongition`）。
+
+> **必须先补元数据，否则服务会段错误。** 从 ModelScope / 3D-Speaker 仓库直接
+> 导出的 onnx **没有** `model_type` 等元数据，sherpa-onnx 2.x 读不到会在 C++
+> 层直接 SIGSEGV——`try/except` 拦不住，整个转写进程会被带走。用一次性工具补：
+
+```bash
+pip install onnx          # 构建期依赖，不是运行时依赖
+PYTHONPATH=src python scripts/patch_speaker_model.py \
+    --input  原始/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx \
+    --output /var/lib/sm-sdk/models/speaker/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
+```
+
+补的内容：`model_type=3d-speaker`、`framework`、`sample_rate`、`language`、
+`feat_dim`/`output_dim`（从图的输入输出形状自动推断）、`normalize_samples=1`、
+`dither=0`、`window_type=hamming`。
+
+其中 **`normalize_samples` 必须为 1**。项目自带 assets 上实测（同一批 3s 切片）：
+
+| 取值 | 同一人 | 不同人 | 间隔 |
+|------|--------|--------|------|
+| `0` | 0.675 ~ 0.890 | 0.170 ~ 0.833 | **−0.159**（重叠，不可用） |
+| `1` | 0.561 ~ 0.864 | −0.064 ~ 0.470 | **+0.092** |
+
+填错这一个值，整套声纹就废了。
+
+补完用标定脚本确认能加载且区分度正常（脚本会先做子进程预检，坏模型只会报错、
+不会崩）：
+
+```bash
+PYTHONPATH=src python scripts/speaker_calibrate.py \
+    --model /var/lib/sm-sdk/models/speaker/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx \
+    --speaker 张三=z1.wav,z2.wav,z3.wav --speaker 李四=l1.wav,l2.wav
+```
+
+服务启动时也会跑一次同样的子进程预检（`speaker/preflight.py`），模型有问题就
+打日志并关闭声纹，不会拖垮转写。
+
+VAD 复用已有的 silero，不额外引入模型；聚类是纯 numpy，不需要模型。
+
+**启用**
+
+```bash
+# 只做说话人分离（谁说的是第 1/2/3 个人）
+python -m multi_stream_asr.main --host 0.0.0.0 --port 8000 --speaker
+
+# 分离 + 声纹识别（命中已注册姓名）
+python -m multi_stream_asr.main --port 8000 \
+  --speaker \
+  --speaker-model /path/to/campplus.onnx \
+  --speaker-registry /opt/multi-stream-asr/output/voiceprints
+```
+
+`--speaker` 关闭时（默认）**不加载模型、报文不带 `speaker` 字段、transcript 格式
+不变**，行为与未引入该功能时一致。
+
+**注册声纹**
+
+```bash
+PYTHONPATH=src python scripts/enroll_speaker.py --list
+PYTHONPATH=src python scripts/enroll_speaker.py --name 张三 --wav z1.wav z2.wav z3.wav
+PYTHONPATH=src python scripts/enroll_speaker.py --check probe.wav
+PYTHONPATH=src python scripts/enroll_speaker.py --remove 张三
+```
+
+每个姓名建议 3 段以上、每段 2~5 秒的**干净近场**语音。拿远场/混响重的音频注册
+会把质心带偏，得不偿失。
+
+**报文新增**
+
+```json
+"segment": {
+  "text": "今天先过一下排期",
+  "speaker": {
+    "id": "spk_1", "label": "S1", "name": "张三",
+    "confidence": 0.83, "is_provisional": false
+  }
+}
+```
+
+会话结束时会额外下发一条 `speaker_remap`：
+
+```json
+{"type": "speaker_remap", "lane_id": 0, "mapping": {"S3": "S1"}}
+```
+
+这是**第二遍全局重聚类**的结果：开头几句质心还没立稳，容易把同一个人拆成两个
+簇，收尾时统一纠正。消费方必须**原子地**套用整张表，不能链式逐条替换，否则
+`S1->S2` 与 `S2->S1` 互换会互相覆盖。
+
+组播链路（`/ws/multicast`）的 `speaker_remap` 在 `finish` 收尾阶段下发，**早于**
+`saved` 消息，所以落盘文件里的标签已经是校正后的。收尾阶段会先让 pipeline 跑完
+再摘除 job，避免最后一句 FINAL 和重标映射被丢掉。
+
+**落盘格式**（`output/transcripts/*.txt`）
+
+```
+# 说话人
+# S1 → 张三（12 句）
+# S2（5 句）
+
+[S1] 今天先过一下排期。
+[S2] 好的，我这边没问题。
+```
+
+**关键参数与标定提醒**
+
+| 参数 | 代码默认 | 说明 |
+|------|---------|------|
+| `min_duration_seconds` | `1.2` | 短于此时长提不出可靠声纹，沿用上一句 |
+| `window_seconds` / `hop_seconds` | `1.5` / `0.5` | 多窗平均，抗混响 |
+| `match_threshold` | `0.55` | 高于此归入最优簇 |
+| `new_speaker_threshold` | `0.45` | 低于此才开新簇（双阈值滞回） |
+| `identify_threshold` / `identify_margin` | `0.55` / `0.05` | 1:N 识别的双门限 |
+| `merge_threshold` | `0.70` | 会话末重聚类/合并门限 |
+| `max_speakers` | `8` | 说话人数上限 |
+
+> **这些默认值按干净近场的 CAM++ 分布给，混响远场不能直接用。** 实测参考：
+>
+> * 干净单人语音：同一人 3s 段之间 **0.69~0.84**，不同人 **0.04~0.21** —— 间隔
+>   约 0.48，一个阈值就能分。
+> * 带 BGM 的直播录音 / 远场混响：同一人掉到 **0.42**，不同人升到 **0.53** ——
+>   区间重叠，任何单阈值都会错分。
+>
+> 上线前必须用真实房间、真实人数录音标定：
+>
+> ```bash
+> PYTHONPATH=src python scripts/speaker_calibrate.py --model M.onnx \
+>     --speaker 张三=z1.wav,z2.wav,z3.wav --speaker 李四=l1.wav,l2.wav
+> ```
+>
+> 它会打印同人/异人的 min/mean/max、间隔、最易混的组合，并按间隔给出建议阈值。
+> **务必用 `--speaker` 显式分组**——`--auto-split-dir` 假设"一个文件一个人"，
+> 而真实录音（新闻/直播/会议）经常中途换人，会把类内估得严重偏低（项目自带的
+> `00_simple_news.wav` 在 40s 处就换了人：与前面主播只有 0.10~0.20）。
+>
+> 间隔 >0.2 可单阈值；0~0.2 必须双门限 + 多窗且二遍重聚类不能关；<0 说明纯软件
+> 做不了，得换麦克风阵列或把产品降级为人工标人。
+
+**算力开销**：声纹与离线 ASR **并行**跑同一段 PCM（ASR 1.5~5 s，声纹 0.1~0.3 s），
+FINAL 时刻不变，净增延迟 ≈ 0。内存上每路一个 embedder 约 28MB。
+
 ---
 
 ## 7. systemd 部署
@@ -257,7 +418,6 @@ multi-stream-asr/
 │   ├── session/           # 会话管理
 │   ├── buffer/            # 音频缓冲
 │   └── headless/          # 无界面模式
-├── multi-asr-runtime/     # K3/RISC-V llama-multi-asr 运行库
 ├── config/                # 热词/敏感词/唤醒词
 ├── deploy/                # systemd 服务文件
 ├── scripts/               # setup.sh、组播收发测试、评测脚本
@@ -282,4 +442,5 @@ multi-stream-asr/
 - `docs/thread-model.md`：asyncio 任务、Python 线程、sherpa-onnx 与 llama-server 线程模型
 - `docs/web-ui-tutorial.html`：Web 界面交互式教程（无需后端，浏览器直接打开）
 - `docs/reports/`：性能与问题排查报告
+- `docs/multicast-api.md`：组播任务管理 REST 接口（增删组播、8 路分配、重启自动恢复）
 - `组播地址修改接口说明.md`：组播地址动态切换接口

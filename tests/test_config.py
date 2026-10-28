@@ -67,11 +67,6 @@ def test_shared_qwen_defaults_match_validated_four_lane_service():
 
     assert shared.host == "127.0.0.1"
     assert shared.port == 8090
-    assert shared.runtime_dir == PROJECT_ROOT / "multi-asr-runtime"
-    assert "Workspace/projects/multi-asr-runtime" not in str(shared.runtime_dir)
-    assert shared.encoder_thread_num == 2
-    assert shared.encoder_affinity == "8;9"
-    assert shared.decoder_cores == "10,11,12,13,14,15"
     assert shared.decoder_threads == 6
     assert shared.n_parallel == 4
     assert shared.n_ctx == 8192

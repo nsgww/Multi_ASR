@@ -16,9 +16,10 @@ from multi_stream_asr.audio.multicast import (
     DEFAULT_MULTICAST_GROUP,
     DEFAULT_MULTICAST_PORT,
 )
-from multi_stream_asr.session.manager import SessionManager
+from multi_stream_asr.session.process_pool import ProcessPoolSessionManager
 from multi_stream_asr.web import messages as msg
 from multi_stream_asr.web.multicast_runtime import MulticastJob, MulticastRuntimeRegistry
+from multi_stream_asr.web.transcript_buffer import TranscriptBuffer, consume_event
 from multi_stream_asr.web.wakeup_gate import WakeupGate, WakeupSettings
 from multi_stream_asr.web.ws_utils import is_client_disconnect
 
@@ -36,7 +37,7 @@ class MulticastHandler:
     def __init__(
         self,
         websocket: WebSocket,
-        session_manager: SessionManager,
+        session_manager: ProcessPoolSessionManager,
         runtime: MulticastRuntimeRegistry,
         *,
         summary_config: SummaryConfig,
@@ -75,9 +76,8 @@ class MulticastHandler:
         self._send_task: asyncio.Task[None] | None = None
         self._closed = False
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._transcript_texts: list[str] = []
+        self._transcript = TranscriptBuffer()
         self._transcript_path: Path | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def run(self) -> None:
         await self._websocket.accept()
@@ -217,7 +217,7 @@ class MulticastHandler:
         self._job = job
         self._attached = True
         self._enable_summary = False
-        self._transcript_texts = []
+        self._transcript.reset()
         self._transcript_path = None
         self._gate.reset()
         job.wakeup_active = False
@@ -278,10 +278,12 @@ class MulticastHandler:
 
     async def _handle_finish(self) -> None:
         self._explicit_finish = True
+        # 先收尾再 detach：收尾阶段 pipeline 还会吐最后一句 FINAL 和
+        # speaker_remap，提前 detach 会把这些事件丢掉（落盘就会缺尾句/说话人）。
+        job = await self._runtime.stop_job(self._group, self._port)
         if self._attached:
             self._runtime.detach(self._group, self._port, self._on_job_event)
             self._attached = False
-        job = await self._runtime.stop_job(self._group, self._port)
         lane_id = job.session.lane_id if job is not None else None
         self._job = None
         # Save transcript and optionally generate summary before returning ready.
@@ -316,10 +318,8 @@ class MulticastHandler:
                 seg = m.get("segment")
                 if isinstance(seg, dict) and seg.get("text"):
                     m = dict(m, segment=dict(seg, text=self._sensitive_filter.filter(seg["text"])))
-                if m.get("is_final"):
-                    text = m["segment"].get("text", "")
-                    if text:
-                        self._transcript_texts.append(text)
+            # final 文本与 speaker_remap 都喂给同一个缓冲，落盘时统一渲染
+            consume_event(self._transcript, m)
             if self._gate.active and self._job is not None and not self._job.wakeup_active:
                 self._job.wakeup_active = True
             self._loop.call_soon_threadsafe(self._enqueue, m)
@@ -338,9 +338,9 @@ class MulticastHandler:
         return f"spacemit-asr-lane{lane_id}-{ts}.txt"
 
     async def _save_transcript(self, lane_id: int) -> Path | None:
-        if not self._transcript_texts:
+        if not self._transcript:
             return None
-        full_text = "\n".join(self._transcript_texts).strip()
+        full_text = self._transcript.render()
         if not full_text:
             return None
         transcript_dir = self._output_dir / "transcripts"
