@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import pytest
 import subprocess
 import tarfile
 
@@ -14,6 +15,8 @@ SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup.sh"
 def test_setup_script_installs_models_from_verified_archives_and_recovers_downloads(
     tmp_path: Path,
 ) -> None:
+    if os.name == "nt":
+        pytest.skip("setup.sh 是板端 Linux 脚本，Windows 无法执行")
     archive_dir = tmp_path / "archives"
     archive_dir.mkdir()
     _write_archives(archive_dir)

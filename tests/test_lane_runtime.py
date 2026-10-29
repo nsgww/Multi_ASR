@@ -152,7 +152,7 @@ def test_real_lane_warms_on_owner_thread_before_lane_loaded(
     lane = config.lane_configs[0]
 
     class FakeOnlineRecognizer:
-        def __init__(self, model_dir: Path, endpoint: object, *, provider_config: Path) -> None:
+        def __init__(self, model_dir: Path, endpoint: object, *, provider_config: Path, **_kwargs) -> None:
             owner_threads.append(threading.get_ident())
 
         async def start_run(self) -> None:
@@ -171,7 +171,7 @@ def test_real_lane_warms_on_owner_thread_before_lane_loaded(
             recognizer_actions.append("reset")
 
     class FakeOfflineRecognizer:
-        def __init__(self, *, shared: object) -> None:
+        def __init__(self, *, shared: object, **_kwargs) -> None:
             pass
 
         async def close(self) -> None:
@@ -256,7 +256,7 @@ def test_real_lane_loads_zipformer_and_shared_client_without_server(
     lane = config.lane_configs[0]
 
     class FakeOnlineRecognizer:
-        def __init__(self, model_dir, endpoint, *, provider_config) -> None:
+        def __init__(self, model_dir, endpoint, *, provider_config, **_kwargs) -> None:
             assert model_dir == config.models.online_model_dir
             assert endpoint is config.endpoint
             assert provider_config == config.models.online_model_dir / "lane-0" / "zipformer.config"
@@ -268,7 +268,7 @@ def test_real_lane_loads_zipformer_and_shared_client_without_server(
             order.append("online_init")
 
     class FakeOfflineRecognizer:
-        def __init__(self, *, shared: object) -> None:
+        def __init__(self, *, shared: object, **_kwargs) -> None:
             assert shared is config.shared_qwen
             order.append("offline_init")
 
@@ -1268,7 +1268,7 @@ def test_load_failure_emits_fatal_outputs_without_constructing_shared_client(
     events = MemoryQueue()
     config = AppConfig(lanes=2, output_dir=tmp_path)
 
-    def fail_online_load(model_dir, endpoint, *, provider_config):
+    def fail_online_load(*args, **kwargs):
         raise RuntimeError("zipformer load failed")
 
     def fail_offline_construction(*, shared):
@@ -1591,14 +1591,18 @@ def test_stop_failure_reports_phase_before_stopped(
     from multi_stream_asr.pipeline import lane_runtime
 
     events = MemoryQueue()
-    config = AppConfig(lanes=2, output_dir=tmp_path)
+    config = AppConfig(
+        lanes=2,
+        output_dir=tmp_path,
+        models=ModelConfig(online_model_dir=tmp_path / "online"),
+    )
 
     class FakeOnlineRecognizer:
-        def __init__(self, model_dir, endpoint, *, provider_config) -> None:
+        def __init__(self, model_dir, endpoint, *, provider_config, **_kwargs) -> None:
             return None
 
     class FailingCloseOfflineRecognizer:
-        def __init__(self, *, shared) -> None:
+        def __init__(self, *, shared, **_kwargs) -> None:
             self.close_calls = 0
 
         async def close(self) -> None:

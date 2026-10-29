@@ -104,15 +104,15 @@ def test_default_config_values():
     )
     assert config.models.online_num_threads == 1
     assert config.models.online_model_dir == Path(
-        "models/asr/"
+        "/var/lib/sm-sdk/models/asr/"
         "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
-    ).resolve()
-    assert config.models.offline_model_dir == (
-        Path(__file__).resolve().parents[1] / "models/asr/qwen3asr"
+    )
+    assert config.models.offline_model_dir == Path(
+        "/var/lib/sm-sdk/models/asr/qwen3asr-1.7b"
     )
     assert config.endpoint == EndpointConfig(
-        rule1_min_trailing_silence=1.0,
-        rule2_min_trailing_silence=0.5,
+        rule1_min_trailing_silence=60.0,
+        rule2_min_trailing_silence=0.7,
         rule3_min_utterance_length=10.0,
         cut_margin_seconds=0.1,
     )
@@ -120,7 +120,7 @@ def test_default_config_values():
     assert config.shared_qwen.request_timeout_ms == 120000
 
 
-@pytest.mark.parametrize("margin", [-0.001, 0.5, 0.6, float("nan"), float("inf")])
+@pytest.mark.parametrize("margin", [-0.001, 0.7, 0.8, float("nan"), float("inf")])
 def test_endpoint_rejects_invalid_cut_margin(margin: float):
     with pytest.raises(ValueError, match="cut_margin_seconds"):
         EndpointConfig(cut_margin_seconds=margin)
@@ -134,14 +134,14 @@ def test_endpoint_accepts_margin_strictly_below_rule2():
     assert endpoint.cut_margin_seconds == 0.249
 
 
-@pytest.mark.parametrize("lanes", [2, 4, 6, 8])
+@pytest.mark.parametrize("lanes", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_supported_lane_counts(lanes):
     assert AppConfig(lanes=lanes).lanes == lanes
 
 
-@pytest.mark.parametrize("lanes", [0, 1, 3, 5, 7, 9])
+@pytest.mark.parametrize("lanes", [0, -1, 9, True, False])
 def test_rejects_unsupported_lane_counts(lanes):
-    with pytest.raises(ValueError, match="lanes must be one of"):
+    with pytest.raises(ValueError, match="lanes must be an integer from 1 to 8"):
         AppConfig(lanes=lanes)
 
 
@@ -221,6 +221,9 @@ def test_validate_offline_model_files_returns_unreadable_required_paths(
 def test_validate_offline_model_files_rejects_required_file_symlink_outside_model_directory(
     tmp_path: Path,
 ):
+    if os.name == "nt":
+        # Windows 创建符号链接需要管理员/开发者模式特权（WinError 1314）
+        pytest.skip("symlink creation requires elevated privileges on Windows")
     model_directory = tmp_path / "models"
     external_directory = tmp_path / "external"
     model_directory.mkdir()

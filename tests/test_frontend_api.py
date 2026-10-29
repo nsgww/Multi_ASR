@@ -180,16 +180,21 @@ def test_websocket_stream_protocol(tmp_path: Path) -> None:
             ready = ws.receive_json()
             assert ready["type"] == "status"
             assert ready["status"] == "ready"
-            assert ready["lane_id"] == 0
+            # ready 在 lane 分配前发出
+            assert "lane_id" not in ready
 
             ws.send_json({"type": "config", "sample_rate": 16000, "channels": 1, "width": 2})
             config_ok = ws.receive_json()
             assert config_ok["type"] == "config_ok"
+            # 会话在 start 时才创建，config_ok 阶段是占位 -1
+            assert config_ok["lane_id"] == -1
 
             ws.send_json({"type": "start"})
             started = ws.receive_json()
             assert started["type"] == "status"
             assert started["status"] == "started"
+            # 真实 lane_id 随 started 状态下发
+            assert started["lane_id"] == 0
 
             ws.send_bytes(b"\0\0" * 1600)
 

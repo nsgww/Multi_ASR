@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+# 历史遗留：本模块按性能线旧 WebApp（/api/recognition/* 批处理流 + 旧版
+# index.html JS 结构）编写。主仓库已重写为 session 池架构（WebSocket 流式
+# 会话/组播/声纹），对应实时覆盖见 test_frontend_api / test_lane_hotswap /
+# test_speaker_api / test_buffers_metrics。恢复这些用例需按新契约重写。
+import pytest
+
+pytest.skip(
+    "targets the retired perf-line webapp; superseded by test_frontend_api/"
+    "test_lane_hotswap/test_speaker_api against the session-pool server",
+    allow_module_level=True,
+)
+
 from dataclasses import replace
 
 from fastapi.testclient import TestClient

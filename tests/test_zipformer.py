@@ -60,7 +60,8 @@ def test_zipformer_recognizer_defaults_to_spacemit_with_quantized_encoder_and_or
     assert captured["tokens"] == str(tmp_path / "tokens.txt")
     assert captured["encoder"] == str(tmp_path / "encoder-epoch-99-avg-1.q.onnx")
     assert captured["decoder"] == str(tmp_path / "decoder-epoch-99-avg-1.onnx")
-    assert captured["joiner"] == str(tmp_path / "joiner-epoch-99-avg-1.onnx")
+    # 无 prefer_q 时 int8 优先于 fp32
+    assert captured["joiner"] == str(tmp_path / "joiner-epoch-99-avg-1.int8.onnx")
     assert captured["provider"] == f"spacemit:{tmp_path / 'zipformer.config'}"
 
 
@@ -110,9 +111,10 @@ def test_zipformer_recognizer_cpu_provider_uses_int8_encoder_and_streaming_joine
 
     ZipformerRecognizer(tmp_path, EndpointConfig(), provider="cpu")
 
+    # cpu provider 不选 .q.onnx：int8 优先，fp32 兜底
     assert captured["encoder"] == str(tmp_path / "encoder-epoch-99-avg-1.int8.onnx")
     assert captured["decoder"] == str(tmp_path / "decoder-epoch-99-avg-1.onnx")
-    assert captured["joiner"] == str(tmp_path / "joiner-epoch-99-avg-1.onnx")
+    assert captured["joiner"] == str(tmp_path / "joiner-epoch-99-avg-1.int8.onnx")
     assert captured["provider"] == "cpu"
 
 
@@ -132,7 +134,7 @@ def test_zipformer_recognizer_fails_when_spacemit_encoder_file_is_missing(monkey
         ),
     )
 
-    with pytest.raises(FileNotFoundError, match="encoder-epoch-99-avg-1.q.onnx"):
+    with pytest.raises(FileNotFoundError, match="required file not found"):
         ZipformerRecognizer(tmp_path, EndpointConfig())
 
 
@@ -286,8 +288,12 @@ async def test_zipformer_reads_token_time_before_endpoint_reset(monkeypatch, tmp
     assert result is not None
     assert result.text == "decoded text"
     assert result.last_token_stream_s == pytest.approx(1.56)
-    assert calls.count("create") == 2
-    assert calls.index("result") < calls.index("reset")
+    # init + start_run + 端点后新建流
+    assert calls.count("create") == 3
+    # 端点不再调 recognizer.reset（sherpa reset 会丢整句），改为直接
+    # create_stream 换新流；结果必须在新流建立前读取
+    assert calls[-1] == "create"
+    assert calls.index("result") < len(calls) - 1
 
 
 @pytest.mark.asyncio
