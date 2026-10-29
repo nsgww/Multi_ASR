@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,7 +22,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 
 from multi_stream_asr.asr.hotwords import load_hotwords
 from multi_stream_asr.asr.kws.keywords_tool import (
@@ -34,7 +35,13 @@ from multi_stream_asr.asr.summary.config import SummaryConfig, load_summary_conf
 from multi_stream_asr.asr.summary.summary_client import SummaryClient
 from multi_stream_asr.asr.summary.summary_server import SummaryServerManager
 from multi_stream_asr.asr.text_filter import SensitiveWordFilter
-from multi_stream_asr.config import AppConfig
+from multi_stream_asr.config import (
+    OFFLINE_MODELS,
+    SUPPORTED_LANES,
+    AppConfig,
+    validate_lane_count,
+    validate_offline_model_files,
+)
 from multi_stream_asr.pipeline.state import PipelineState
 from multi_stream_asr.session.process_pool import ProcessPoolSessionManager
 from multi_stream_asr.speaker import SherpaSpeakerEmbedder, VoiceprintRegistry
@@ -125,6 +132,37 @@ def _default_session_manager_factory(
     return ProcessPoolSessionManager(config=config, event_bus=event_bus)
 
 
+class LoadModelsRequest(BaseModel):
+    """通道热改 / 模型重载请求（对齐性能调优线的 /api/models/load）。
+
+    所有字段可选：不带的字段沿用当前配置。``lanes`` 变化需要先 unload
+    再 load（服务端会整体重建 session 池）。
+    """
+
+    lanes: StrictInt | None = None
+    offline_model_id: str | None = None
+    offline_model_dir: Path | None = None
+
+
+def _config_from_load_request(config: AppConfig, request: LoadModelsRequest) -> AppConfig:
+    """把 load 请求折叠成新 AppConfig（只覆盖请求里出现的字段）。"""
+    lanes = config.lanes if request.lanes is None else validate_lane_count(request.lanes)
+    models = config.models
+    kwargs: dict[str, Any] = {}
+    if request.offline_model_id is not None:
+        if request.offline_model_id not in OFFLINE_MODELS:
+            raise KeyError(
+                f"unsupported offline model: {request.offline_model_id!r}; "
+                f"expected one of {sorted(OFFLINE_MODELS)}"
+            )
+        kwargs["offline_model_id"] = request.offline_model_id
+    if request.offline_model_dir is not None:
+        kwargs["offline_model_dir"] = request.offline_model_dir.expanduser()
+    if kwargs:
+        models = replace(models, **kwargs)
+    return replace(config, lanes=lanes, models=models)
+
+
 def _status_payload(app: FastAPI) -> dict[str, Any]:
     manager: ProcessPoolSessionManager = app.state.session_manager
     kws_cfg = app.state.config.kws
@@ -134,6 +172,8 @@ def _status_payload(app: FastAPI) -> dict[str, Any]:
         "max_sessions": app.state.config.max_concurrent_sessions,
         "alive_lanes": manager.alive_lanes,
         "port": app.state.config.web_port,
+        "lanes": app.state.config.lanes,
+        "supported_lanes": list(SUPPORTED_LANES),
         "kws": {
             "enabled": kws_cfg.enabled,
             "loaded": manager.kws_loaded,
@@ -165,6 +205,11 @@ def create_app(
     bus = event_bus or FrontendEventBus()
     factory = session_manager_factory or _default_session_manager_factory
     manager = session_manager or factory(app_config, bus)
+
+    def _live_manager() -> ProcessPoolSessionManager:
+        # /api/models/load 通道热改会整体换掉 session 池；所有运行期引用
+        # 必须走 app.state，闭包缓存初始实例会在热改后指向旧池
+        return app.state.session_manager
     multicast_runtime = MulticastRuntimeRegistry(
         manager,
         max_jobs=app_config.max_concurrent_sessions,
@@ -177,7 +222,7 @@ def create_app(
     async def lifespan(app: FastAPI):
         app.state.broadcast_task = asyncio.create_task(bus.broadcast_loop())
         try:
-            await manager.load_models()
+            await _live_manager().load_models()
             # 重启后自动拉起上次在跑的组播任务（清单由 registry 持久化维护）
             await multicast_runtime.restore_jobs(
                 local_ip="0.0.0.0",
@@ -196,7 +241,7 @@ def create_app(
         finally:
             with suppress(Exception):
                 await multicast_runtime.stop_all()
-            await manager.unload_models()
+            await _live_manager().unload_models()
             if getattr(app.state, "summary_server_manager", None) is not None:
                 with suppress(Exception):
                     await asyncio.to_thread(app.state.summary_server_manager.stop)
@@ -255,6 +300,79 @@ def create_app(
     async def health() -> dict[str, Any]:
         return _status_payload(app)
 
+    @app.post("/api/models/validate")
+    async def validate_models(request: LoadModelsRequest | None = None) -> dict[str, Any]:
+        request = request or LoadModelsRequest()
+        try:
+            next_config = _config_from_load_request(app.state.config, request)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        spec = next_config.models.offline_model
+        try:
+            invalid = validate_offline_model_files(spec)
+        except OSError:
+            # 模型目录本身不存在/不可达：目录及全部必需文件记为缺失
+            invalid = [spec.model_dir / name for name in spec.required_filenames]
+        return {
+            "valid": not invalid,
+            "lanes": next_config.lanes,
+            "offline_model_id": next_config.models.offline_model_id,
+            "model_dir": str(next_config.models.offline_model_dir),
+            "missing_files": [str(path) for path in invalid],
+        }
+
+    @app.post("/api/models/load")
+    async def load_models(request: LoadModelsRequest | None = None) -> dict[str, Any]:
+        """按请求重建 session 池（通道热改）。配置未变时仅重新加载模型。"""
+        request = request or LoadModelsRequest()
+        current: AppConfig = app.state.config
+        try:
+            next_config = _config_from_load_request(current, request)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if next_config != current:
+            manager = _live_manager()
+            if manager.state is not PipelineState.UNLOADED:
+                raise HTTPException(
+                    status_code=409,
+                    detail="unload models before changing lanes or offline model",
+                )
+            if multicast_runtime.list_jobs():
+                raise HTTPException(
+                    status_code=409,
+                    detail="stop multicast jobs before changing lanes or offline model",
+                )
+            next_manager = factory(next_config, bus)
+            try:
+                await next_manager.load_models()
+            except Exception:
+                if next_manager.state is not PipelineState.UNLOADED:
+                    with suppress(Exception):
+                        await next_manager.unload_models()
+                raise
+            app.state.config = next_config
+            app.state.session_manager = next_manager
+            multicast_runtime.set_session_manager(next_manager)
+        else:
+            await _live_manager().load_models()
+        return _status_payload(app)
+
+    @app.post("/api/models/unload")
+    async def unload_models() -> dict[str, Any]:
+        manager = _live_manager()
+        if manager.active_sessions:
+            raise HTTPException(
+                status_code=409,
+                detail="stop active sessions before unloading models",
+            )
+        if multicast_runtime.list_jobs():
+            raise HTTPException(
+                status_code=409,
+                detail="stop multicast jobs before unloading models",
+            )
+        await manager.unload_models()
+        return _status_payload(app)
+
     def _words_file_for(kind: str) -> Path:
         if kind == "hotwords":
             return app_config.hotwords_file
@@ -289,7 +407,7 @@ def create_app(
         write_word_list(path, words, header=_WORD_FILE_HEADERS[kind])
         try:
             if kind == "hotwords":
-                manager.set_hotwords(words)
+                _live_manager().set_hotwords(words)
                 note = "精修热词即时生效；在线 Zipformer 热词需重启（默认关闭）"
             else:
                 sensitive_filter.update_words(words)
@@ -298,7 +416,7 @@ def create_app(
             # 热更新失败：回滚文件与内存
             write_word_list(path, old_words, header=_WORD_FILE_HEADERS[kind])
             if kind == "hotwords":
-                manager.set_hotwords(old_words)
+                _live_manager().set_hotwords(old_words)
             else:
                 sensitive_filter.update_words(old_words)
             raise
@@ -333,12 +451,12 @@ def create_app(
         # 注意：sherpa KWS 原生解析器不支持 # 注释行，keywords 文件不写注释头
         write_word_list(path, lines)
         try:
-            await asyncio.to_thread(manager.reload_kws_keywords)
+            await asyncio.to_thread(_live_manager().reload_kws_keywords)
         except Exception:
             if old_text is not None:
                 path.write_text(old_text, encoding="utf-8")
                 with suppress(Exception):
-                    await asyncio.to_thread(manager.reload_kws_keywords)
+                    await asyncio.to_thread(_live_manager().reload_kws_keywords)
             raise
         response: dict[str, Any] = {
             "kind": "keywords",
@@ -499,7 +617,7 @@ def create_app(
         wakeup_enabled = params.get("wakeup", "true").lower() not in ("0", "false", "no")
         handler = StreamHandler(
             websocket=websocket,
-            session_manager=manager,
+            session_manager=_live_manager(),
             summary_config=summary_cfg,
             output_dir=app_config.output_dir,
             sample_rate=sample_rate,
@@ -625,7 +743,7 @@ def create_app(
         return embedder
 
     def _broadcast_speaker_reload() -> None:
-        reload_fn = getattr(manager, "reload_speaker_registry", None)
+        reload_fn = getattr(_live_manager(), "reload_speaker_registry", None)
         if reload_fn is not None:
             reload_fn()
 
@@ -711,7 +829,7 @@ def create_app(
         params = websocket.query_params
         handler = MulticastHandler(
             websocket=websocket,
-            session_manager=manager,
+            session_manager=_live_manager(),
             runtime=multicast_runtime,
             summary_config=summary_cfg,
             output_dir=app_config.output_dir,
@@ -776,13 +894,13 @@ def create_app(
         response_format: str = Form("json"),
         enable_summary: bool = Form(False),
     ) -> Response:
-        if manager.state is not PipelineState.LOADED:
+        if _live_manager().state is not PipelineState.LOADED:
             raise HTTPException(
                 status_code=503,
                 detail="service is not loaded",
             )
         return await handle_offline_transcription(
-            config=app_config,
+            config=app.state.config,
             summary_config=summary_cfg,
             file=file,
             response_format=response_format,

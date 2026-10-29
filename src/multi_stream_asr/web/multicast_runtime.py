@@ -58,6 +58,14 @@ class MulticastRuntimeRegistry:
         self._jobs: dict[tuple[str, int], MulticastJob] = {}
         self._lock = asyncio.Lock()
 
+    def set_session_manager(self, manager: ProcessPoolSessionManager) -> None:
+        """通道热改（/api/models/load）后替换底层 session 池。
+
+        仅允许在无运行中任务时调用（load 接口已用 409 保证），否则旧任务
+        的 session 会悬在已被丢弃的旧池上。
+        """
+        self._session_manager = manager
+
     @property
     def max_jobs(self) -> int:
         return self._max_jobs
