@@ -839,12 +839,19 @@ class LanePipeline:
                     }
                 )
             if result.timings is not None:
-                self.shared_timings_tracker.add(result.timings)
+                self.shared_timings_tracker.add(
+                    result.timings,
+                    audio_seconds=result.audio_seconds,
+                )
                 if self.shared_timing_writer is not None:
                     filtered = _filter_shared_timings(result.timings)
                     if filtered:
                         self.shared_timing_writer.record(
-                            {"sentence_id": sentence_id, **filtered}
+                            {
+                                "sentence_id": sentence_id,
+                                "audio_seconds": result.audio_seconds,
+                                **filtered,
+                            }
                         )
             self._record_model_output(
                 model="qwen3-asr",

@@ -517,7 +517,7 @@ async def test_fake_headless_mode_emits_events_saves_output_unloads_and_returns_
     assert EventStatus.LANE_FINISHED in statuses
 
     metrics_payload = json.loads((runner.last_run_dir / "metrics.json").read_text())
-    assert metrics_payload["metrics_schema_version"] == 3
+    assert metrics_payload["metrics_schema_version"] == 5
     assert [lane["final_state"] for lane in metrics_payload["lanes"]] == ["finished", "finished"]
     assert "event_loop_lag" in metrics_payload
     assert "max_ms" in metrics_payload["event_loop_lag"]

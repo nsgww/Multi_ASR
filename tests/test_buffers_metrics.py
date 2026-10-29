@@ -14,6 +14,7 @@ from multi_stream_asr.log.metrics import (
     LatencyTracker,
     RtfTracker,
     SharedTimingsTracker,
+    _nearest_rank_percentile,
     merge_latency_summaries,
     merge_rtf_summaries,
     merge_shared_timing_summaries,
@@ -63,6 +64,7 @@ def test_shared_timing_tracker_records_only_known_finite_fields():
         "count": 2,
         "total_ms": 40.0,
         "average_ms": 20.0,
+        "p95_ms": 30.0,
         "max_ms": 30.0,
     }
     assert payload["encode_ms"]["count"] == 1
@@ -98,6 +100,7 @@ def test_merge_shared_timing_summaries_weights_by_field_count():
         "count": 3,
         "total_ms": 90.0,
         "average_ms": 30.0,
+        "p95_ms": 0.0,
         "max_ms": 50.0,
     }
 from multi_stream_asr.log.recorder import RunRecorder
@@ -368,7 +371,12 @@ def test_latency_tracker_add_contends_with_single_snapshot():
             with self._lock:
                 snapshot_entered.set()
                 release_snapshot.wait()
-                return self._count, self._total_ms, self._max_ms
+                return (
+                    self._count,
+                    self._total_ms,
+                    self._max_ms,
+                    _nearest_rank_percentile(self.samples_ms),
+                )
 
     class SignalingFloat:
         def __float__(self) -> float:
@@ -400,12 +408,14 @@ def test_latency_tracker_add_contends_with_single_snapshot():
         "count": 1,
         "total_ms": 10.0,
         "average_ms": 10.0,
+        "p95_ms": 10.0,
         "max_ms": 10.0,
     }
     assert tracker.as_dict() == {
         "count": 2,
         "total_ms": 30.0,
         "average_ms": 15.0,
+        "p95_ms": 20.0,
         "max_ms": 20.0,
     }
 
@@ -416,13 +426,25 @@ def test_summary_mergers_recompute_weighted_averages():
             {"count": 2, "total_ms": 100.0, "average_ms": 50.0, "max_ms": 60.0},
             {"count": 1, "total_ms": 90.0, "average_ms": 90.0, "max_ms": 90.0},
         ]
-    ) == {"count": 3, "total_ms": 190.0, "average_ms": 190.0 / 3.0, "max_ms": 90.0}
+    ) == {
+        "count": 3,
+        "total_ms": 190.0,
+        "average_ms": 190.0 / 3.0,
+        "p95_ms": 0.0,
+        "max_ms": 90.0,
+    }
     assert merge_rtf_summaries(
         [
             {"count": 2, "total": 0.8, "average": 0.4, "max": 0.5},
             {"count": 1, "total": 0.6, "average": 0.6, "max": 0.6},
         ]
-    ) == {"count": 3, "total": 1.4, "average": 1.4 / 3.0, "max": 0.6}
+    ) == {
+        "count": 3,
+        "total": 1.4,
+        "average": 1.4 / 3.0,
+        "p95": 0.0,
+        "max": 0.6,
+    }
 
 
 def test_run_recorder_writes_config_metrics_and_results(tmp_path: Path):
@@ -471,7 +493,7 @@ def test_run_recorder_writes_config_metrics_and_results(tmp_path: Path):
 
     assert config_json["lanes"] == 4
     assert config_json["segment_cache_seconds"] == 15.0
-    assert metrics_json["metrics_schema_version"] == 2
+    assert metrics_json["metrics_schema_version"] == 5
     assert "latency" not in metrics_json
     assert "rtf" not in metrics_json
     assert metrics_json["online_frame_latency"]["average_ms"] == 100.0
@@ -544,7 +566,7 @@ def test_run_recorder_writes_per_lane_compact_model_outputs_jsonl(tmp_path: Path
     }
 
 
-def test_run_recorder_save_process_run_writes_schema_v3_without_rewriting_lane_files(tmp_path: Path):
+def test_run_recorder_save_process_run_writes_schema_v5_without_rewriting_lane_files(tmp_path: Path):
     recorder = RunRecorder()
     config = AppConfig(lanes=2, output_dir=tmp_path)
     run_dir = tmp_path / "run"
@@ -592,19 +614,27 @@ def test_run_recorder_save_process_run_writes_schema_v3_without_rewriting_lane_f
 
     metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
     assert saved == run_dir
-    assert metrics["metrics_schema_version"] == 3
+    assert metrics["metrics_schema_version"] == 5
     assert metrics["online_frame_latency"] == {
         "count": 4,
         "total_ms": 220.0,
         "average_ms": 55.0,
+        "p95_ms": 0.0,
         "max_ms": 70.0,
     }
-    assert metrics["offline_rtf"] == {"count": 2, "total": 0.9, "average": 0.45, "max": 0.5}
+    assert metrics["offline_rtf"] == {
+        "count": 2,
+        "total": 0.9,
+        "average": 0.45,
+        "p95": 0.0,
+        "max": 0.5,
+    }
     assert metrics["offline_shared_timings"]["count"] == 2
     assert metrics["offline_shared_timings"]["queue_ms"] == {
         "count": 2,
         "total_ms": 40.0,
         "average_ms": 20.0,
+        "p95_ms": 0.0,
         "max_ms": 30.0,
     }
     assert metrics["event_loop_lag"]["max_ms"] == 4.0

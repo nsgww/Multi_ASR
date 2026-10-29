@@ -38,9 +38,10 @@ _ZERO_LATENCY = {
     "count": 0,
     "total_ms": 0.0,
     "average_ms": 0.0,
+    "p95_ms": 0.0,
     "max_ms": 0.0,
 }
-_ZERO_RTF = {"count": 0, "total": 0.0, "average": 0.0, "max": 0.0}
+_ZERO_RTF = {"count": 0, "total": 0.0, "average": 0.0, "p95": 0.0, "max": 0.0}
 _ALLOWED_MESSAGE_TYPES = frozenset(
     {
         "asr_event",

@@ -1462,6 +1462,7 @@ async def test_shared_timing_writer_records_sentence_id_and_filtered_fields():
     assert shared_timing_writer.records == [
         {
             "sentence_id": 0,
+            "audio_seconds": 1.0,
             "queue_ms": 10.0,
             "encode_ms": 100.0,
             "prefill_ms": 20.0,

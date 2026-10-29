@@ -8,6 +8,7 @@ from typing import Any
 
 from multi_stream_asr.config import AppConfig
 from multi_stream_asr.log.metrics import (
+    METRICS_SCHEMA_VERSION,
     EventLoopLagTracker,
     LatencyTracker,
     RtfTracker,
@@ -126,7 +127,7 @@ class RunRecorder:
         (output_dir / "config.json").write_text(json.dumps(config_payload, indent=2, sort_keys=True))
 
         metrics_payload = {
-            "metrics_schema_version": 2,
+            "metrics_schema_version": METRICS_SCHEMA_VERSION,
             "online_frame_latency": (
                 latency_tracker.as_dict() if latency_tracker is not None else LatencyTracker().as_dict()
             ),
@@ -168,7 +169,7 @@ class RunRecorder:
             lanes.append({**lane_metrics, **lane})
 
         metrics_payload = {
-            "metrics_schema_version": 3,
+            "metrics_schema_version": METRICS_SCHEMA_VERSION,
             "online_frame_latency": merge_latency_summaries(
                 [dict(lane.get("online_frame_latency", {})) for lane in lanes]
             ),
