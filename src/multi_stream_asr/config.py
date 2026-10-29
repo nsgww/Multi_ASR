@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 
 
-SUPPORTED_LANES = (2, 4, 6, 8)
+MIN_LANES = 1
+MAX_LANES = 8
+SUPPORTED_LANES = tuple(range(MIN_LANES, MAX_LANES + 1))
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ONLINE_MODEL_DIR = Path(
     "/var/lib/sm-sdk/models/asr/"
@@ -183,6 +185,18 @@ class LaneInputConfig:
             and not self.microphone_device_id.strip()
         ):
             raise ValueError("microphone_device_id must be non-empty")
+
+
+def validate_lane_count(lanes: object) -> int:
+    if (
+        isinstance(lanes, bool)
+        or not isinstance(lanes, int)
+        or not MIN_LANES <= lanes <= MAX_LANES
+    ):
+        raise ValueError(
+            f"lanes must be an integer from {MIN_LANES} to {MAX_LANES}, got {lanes!r}"
+        )
+    return lanes
 
 
 def validate_offline_model_files(spec: OfflineModelSpec) -> list[Path]:
@@ -409,8 +423,7 @@ class AppConfig:
     hotwords_online: bool = False
 
     def __post_init__(self) -> None:
-        if self.lanes not in SUPPORTED_LANES:
-            raise ValueError(f"lanes must be one of {SUPPORTED_LANES}, got {self.lanes}")
+        validate_lane_count(self.lanes)
         if self.lane_inputs and len(self.lane_inputs) != self.lanes:
             raise ValueError("lane_inputs must be empty or match lanes")
 
@@ -431,6 +444,5 @@ class AppConfig:
 
 
 def build_lane_configs(lanes: int) -> list[LaneConfig]:
-    if lanes not in SUPPORTED_LANES:
-        raise ValueError(f"lanes must be one of {SUPPORTED_LANES}, got {lanes}")
-    return [LaneConfig(stream_id=stream_id) for stream_id in range(lanes)]
+    validated_lanes = validate_lane_count(lanes)
+    return [LaneConfig(stream_id=stream_id) for stream_id in range(validated_lanes)]

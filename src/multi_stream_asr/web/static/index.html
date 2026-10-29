@@ -221,6 +221,53 @@
         grid-template-rows: repeat(2, 1fr);
       }
 
+      .lane-grid[data-lanes="1"] {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: 1fr;
+      }
+
+      .lane-grid[data-lanes="3"] {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-rows: repeat(2, 1fr);
+      }
+      .lane-grid[data-lanes="3"] > .lane { grid-column: span 2; }
+      .lane-grid[data-lanes="3"] > .lane:last-child {
+        grid-column: 2 / span 2;
+        grid-row: 2;
+      }
+
+      .lane-grid[data-lanes="5"] {
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        grid-template-rows: repeat(2, 1fr);
+      }
+      .lane-grid[data-lanes="5"] > .lane { grid-column: span 2; }
+      .lane-grid[data-lanes="5"] > .lane:nth-child(4) {
+        grid-column: 2 / span 2;
+        grid-row: 2;
+      }
+      .lane-grid[data-lanes="5"] > .lane:nth-child(5) {
+        grid-column: 4 / span 2;
+        grid-row: 2;
+      }
+
+      .lane-grid[data-lanes="7"] {
+        grid-template-columns: repeat(8, minmax(0, 1fr));
+        grid-template-rows: repeat(2, 1fr);
+      }
+      .lane-grid[data-lanes="7"] > .lane { grid-column: span 2; }
+      .lane-grid[data-lanes="7"] > .lane:nth-child(5) {
+        grid-column: 2 / span 2;
+        grid-row: 2;
+      }
+      .lane-grid[data-lanes="7"] > .lane:nth-child(6) {
+        grid-column: 4 / span 2;
+        grid-row: 2;
+      }
+      .lane-grid[data-lanes="7"] > .lane:nth-child(7) {
+        grid-column: 6 / span 2;
+        grid-row: 2;
+      }
+
       .lane {
         min-height: 0;
         display: grid;
@@ -265,6 +312,10 @@
         .brand { width: 100%; }
         .lane-grid { min-height: 70vh; overflow: visible; }
         .lane-grid[data-lanes] { grid-template-columns: 1fr; grid-template-rows: none; }
+        .lane-grid[data-lanes] > .lane:nth-child(n) {
+          grid-column: auto;
+          grid-row: auto;
+        }
         .lane { min-height: 240px; }
       }
     </style>
@@ -295,9 +346,13 @@
         <div class="control-group">
           <label for="lane-count">Lanes</label>
           <select id="lane-count">
+            <option value="1">1</option>
             <option value="2">2</option>
+            <option value="3">3</option>
             <option value="4" selected>4</option>
+            <option value="5">5</option>
             <option value="6">6</option>
+            <option value="7">7</option>
             <option value="8">8</option>
           </select>
           <label for="offline-model">Offline model</label>
