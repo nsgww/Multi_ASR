@@ -9,7 +9,16 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import FastAPI, Form, HTTPException, Request, Response, UploadFile, WebSocket
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -28,6 +37,8 @@ from multi_stream_asr.asr.text_filter import SensitiveWordFilter
 from multi_stream_asr.config import AppConfig
 from multi_stream_asr.pipeline.state import PipelineState
 from multi_stream_asr.session.process_pool import ProcessPoolSessionManager
+from multi_stream_asr.speaker import SherpaSpeakerEmbedder, VoiceprintRegistry
+from multi_stream_asr.speaker.audio import wav_bytes_to_pcm16k
 from multi_stream_asr.audio.multicast import (
     DEFAULT_MULTICAST_GROUP,
     DEFAULT_MULTICAST_PORT,
@@ -98,6 +109,8 @@ _MAX_WORD_LEN = 64
 _WORD_UPLOAD_MAX_BYTES = 1024 * 1024
 _WORD_UPLOAD_MAX_WORDS = 5000
 _WORD_BACKUP_KEEP = 5
+_MAX_SPEAKER_NAME_LEN = 64
+_MAX_ENROLL_FILES = 8
 _WORD_FILE_HEADERS = {
     "hotwords": "# 热词表：一行一词，# 开头为注释（由 /v1/config/words 接口动态更新）",
     "sensitive": "# 敏感词表：一行一词，# 开头为注释（由 /v1/config/words 接口动态更新）",
@@ -579,6 +592,119 @@ def create_app(
             "lane_id": job.session.lane_id,
             "note": "原收听连接已断开，请用新地址重新收听",
         }
+
+    # -- 声纹库管理（注册后热重载到各 lane，无需重启） ------------------------
+
+    def _speaker_registry_dir() -> Path:
+        return app_config.speaker.registry_dir or (
+            app_config.output_dir / "voiceprints"
+        )
+
+    def _speaker_registry() -> VoiceprintRegistry:
+        registry = getattr(app.state, "speaker_registry", None)
+        if registry is None:
+            registry = VoiceprintRegistry(_speaker_registry_dir())
+            app.state.speaker_registry = registry
+        return registry
+
+    async def _speaker_embedder() -> SherpaSpeakerEmbedder:
+        embedder = getattr(app.state, "speaker_embedder", None)
+        if embedder is None:
+            cfg = app_config.speaker
+            embedder = await asyncio.to_thread(
+                SherpaSpeakerEmbedder,
+                model_path=cfg.model_path,
+                num_threads=cfg.num_threads,
+                provider=cfg.provider,
+                sample_rate=cfg.sample_rate,
+                window_seconds=cfg.window_seconds,
+                hop_seconds=cfg.hop_seconds,
+                trim_floor_ratio=cfg.trim_floor_ratio,
+            )
+            app.state.speaker_embedder = embedder
+        return embedder
+
+    def _broadcast_speaker_reload() -> None:
+        reload_fn = getattr(manager, "reload_speaker_registry", None)
+        if reload_fn is not None:
+            reload_fn()
+
+    def _require_speaker_enabled() -> None:
+        if not app_config.speaker.enabled:
+            raise HTTPException(status_code=503, detail="声纹识别未启用")
+
+    @app.get("/v1/speakers")
+    async def list_speakers() -> dict[str, Any]:
+        registry = _speaker_registry()
+        return {
+            "enabled": app_config.speaker.enabled,
+            "speakers": [
+                {"name": n, "count": registry.count(n)} for n in registry.names()
+            ],
+        }
+
+    @app.post("/v1/speakers")
+    async def enroll_speaker(
+        name: str = Form(...),
+        files: list[UploadFile] = File(...),
+    ) -> dict[str, Any]:
+        """注册声纹：multipart 上传 1~8 个 16bit PCM wav（任意采样率/声道）。"""
+        _require_speaker_enabled()
+        key = name.strip()
+        if not key or len(key) > _MAX_SPEAKER_NAME_LEN:
+            raise HTTPException(
+                status_code=400,
+                detail=f"name 需为 1~{_MAX_SPEAKER_NAME_LEN} 个字符",
+            )
+        if not 1 <= len(files) <= _MAX_ENROLL_FILES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"files 需为 1~{_MAX_ENROLL_FILES} 个 wav 文件",
+            )
+        embedder = await _speaker_embedder()
+        if not getattr(embedder, "available", True):
+            raise HTTPException(
+                status_code=503,
+                detail=f"声纹模型不可用: {getattr(embedder, 'last_error', None)}",
+            )
+
+        # 先全部提取完再入库，避免第 N 个文件失败导致半成品注册
+        vectors: list[Any] = []
+        for upload in files:
+            data = await upload.read()
+            try:
+                pcm = wav_bytes_to_pcm16k(data)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"{upload.filename}: {exc}"
+                ) from None
+            vec = await asyncio.to_thread(embedder.embed, pcm)
+            if vec is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{upload.filename}: 音频过短或无声，无法提取声纹",
+                )
+            vectors.append(vec)
+
+        registry = _speaker_registry()
+        for vec in vectors:
+            registry.enroll(key, vec)
+        _broadcast_speaker_reload()
+        return {
+            "ok": True,
+            "name": key,
+            "enrolled": len(vectors),
+            "total": registry.count(key),
+        }
+
+    @app.delete("/v1/speakers/{name}")
+    async def delete_speaker(name: str) -> dict[str, Any]:
+        _require_speaker_enabled()
+        registry = _speaker_registry()
+        if not registry.remove(name):
+            raise HTTPException(status_code=404, detail=f"声纹不存在: {name}")
+        _broadcast_speaker_reload()
+        return {"ok": True, "name": name}
 
     @app.websocket("/ws/multicast")
     async def websocket_multicast(websocket: WebSocket) -> None:

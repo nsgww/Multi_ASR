@@ -182,9 +182,12 @@ class EndpointConfig:
 class ModelConfig:
     online_model_dir: Path = DEFAULT_ONLINE_MODEL_DIR
     # 2026-08-04 起默认使用官方 1.7B（热词能力+准确率更好）；
-    # 回退 0.6B：改为 "qwen3-asr-0.6b-q40" 且 offline_model_dir 改回 DEFAULT_OFFLINE_MODEL_DIR
-    offline_model_id: str = "qwen3-asr-1.7b-q4km"
-    offline_model_dir: Path = Path("/var/lib/sm-sdk/models/asr/qwen3asr-1.7b")
+    # 回退 0.6B：环境变量 OFFLINE_MODEL_DIR=/var/lib/sm-sdk/models/asr/qwen3asr
+    # （规格按目录内容自动匹配，offline_model_id 只是兜底）
+    offline_model_id: str = os.getenv("OFFLINE_MODEL_ID", "qwen3-asr-1.7b-q4km")
+    offline_model_dir: Path = Path(
+        os.getenv("OFFLINE_MODEL_DIR", "/var/lib/sm-sdk/models/asr/qwen3asr-1.7b")
+    )
     online_num_threads: int = 1
 
     def __post_init__(self) -> None:
@@ -242,7 +245,9 @@ class SpeakerConfig:
     # 声纹库目录；None 表示用 <output_dir>/voiceprints。目录不存在=只做分离不做识别
     registry_dir: Path | None = None
     provider: str = "cpu"
-    num_threads: int = 1
+    # 声纹提取线程数：1 线程时多窗（1.5s/0.5s hop）提 4s 音频约 2.3s，
+    # 会拖慢 FINAL（FINAL 等声纹结果）；K3 上 2 线程约 1.2s、4 线程约 0.9s
+    num_threads: int = int(os.getenv("SPEAKER_NUM_THREADS", "1"))
     sample_rate: int = 16000
 
     # 段长下限：短于这个长度提不出可靠声纹，直接沿用上一句

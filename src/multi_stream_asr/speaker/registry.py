@@ -60,6 +60,15 @@ class VoiceprintRegistry:
 
     # -- 查询 -------------------------------------------------------------
 
+    def reload(self) -> None:
+        """从磁盘重新加载（REST 注册/删除后由各 lane 热重载）。"""
+        if self._directory is None:
+            return
+        with self._lock:
+            self._prints = {}
+            self._files = {}
+            self._load()
+
     @property
     def directory(self) -> Path | None:
         return self._directory

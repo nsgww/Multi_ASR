@@ -106,6 +106,11 @@ class ProcessPoolSessionManager:
             if controller.is_alive():
                 controller.send({"type": "reload_kws"})
 
+    def reload_speaker_registry(self) -> None:
+        for controller in self._controllers.values():
+            if controller.is_alive():
+                controller.send({"type": "reload_speaker"})
+
     async def load_models(self) -> None:
         async with self._lifecycle_lock:
             if self._state is not PipelineState.UNLOADED:

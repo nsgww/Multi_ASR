@@ -442,5 +442,6 @@ multi-stream-asr/
 - `docs/thread-model.md`：asyncio 任务、Python 线程、sherpa-onnx 与 llama-server 线程模型
 - `docs/web-ui-tutorial.html`：Web 界面交互式教程（无需后端，浏览器直接打开）
 - `docs/reports/`：性能与问题排查报告
-- `docs/multicast-api.md`：组播任务管理 REST 接口（增删组播、8 路分配、重启自动恢复）
+- `docs/multicast-api.md`：组播任务管理 REST 接口（增删改/持久化/重启恢复）
+- `docs/声纹识别与说话人分离说明.md`：声纹/说话人分离的部署、性能与运维
 - `组播地址修改接口说明.md`：组播地址动态切换接口

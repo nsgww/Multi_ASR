@@ -220,6 +220,17 @@ async def test_set_hotwords_and_reload_kws_broadcast(manager) -> None:
     await manager.unload_models()
 
 
+async def test_reload_speaker_registry_broadcast(manager) -> None:
+    await manager.load_models()
+
+    manager.reload_speaker_registry()
+
+    for controller in controllers_of(manager).values():
+        assert {"type": "reload_speaker"} in controller.commands
+
+    await manager.unload_models()
+
+
 async def test_reload_kws_raises_when_not_loaded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -217,6 +217,7 @@ class LaneRuntime:
         self._lane_stopped_sent = False
         self._kws_spotter: SherpaKeywordSpotter | None = None
         self._speaker_registry: VoiceprintRegistry | None = None
+        self._speaker_embedder: SherpaSpeakerEmbedder | None = None
         self._latency_tracker = LatencyTracker()
         self._rtf_tracker = RtfTracker()
         self._shared_timings_tracker = SharedTimingsTracker()
@@ -406,23 +407,37 @@ class LaneRuntime:
             )
             return
         self._speaker_registry = VoiceprintRegistry(registry_dir)
+        # embedder 每 lane 只建一份并在加载期预热（sherpa 加载模型约 6.5s，
+        # 若等到首个句子才建会直接把 FINAL 拖慢 6 秒多）
+        try:
+            self._speaker_embedder = SherpaSpeakerEmbedder(
+                model_path=model_path,
+                num_threads=cfg.num_threads,
+                provider=cfg.provider,
+                sample_rate=cfg.sample_rate,
+                window_seconds=cfg.window_seconds,
+                hop_seconds=cfg.hop_seconds,
+                trim_floor_ratio=cfg.trim_floor_ratio,
+            )
+            t0 = time.monotonic()
+            self._speaker_embedder.embed(np.zeros(cfg.sample_rate // 2, dtype=np.float32))
+            _logger.info(
+                "声纹模型已预热 lane=%d (%.1fs)", self.lane.stream_id, time.monotonic() - t0
+            )
+        except Exception:
+            _logger.exception("声纹模型预热失败，本 lane 关闭声纹 lane=%d", self.lane.stream_id)
+            self._speaker_embedder = None
+            self._speaker_registry = None
 
     def _create_speaker_tracker(self) -> SpeakerTracker | None:
-        """每次 run 新建一个 tracker（每 lane 一份 embedder，约 28MB）。"""
+        """每次 run 新建一个 tracker；embedder 复用 lane 级缓存。"""
         cfg = self.app_config.speaker
         if self.process_config.fake or not cfg.enabled or self._speaker_registry is None:
             return None
-        embedder = SherpaSpeakerEmbedder(
-            model_path=Path(cfg.model_path),
-            num_threads=cfg.num_threads,
-            provider=cfg.provider,
-            sample_rate=cfg.sample_rate,
-            window_seconds=cfg.window_seconds,
-            hop_seconds=cfg.hop_seconds,
-            trim_floor_ratio=cfg.trim_floor_ratio,
-        )
+        if self._speaker_embedder is None:
+            return None
         return SpeakerTracker(
-            embedder=embedder,
+            embedder=self._speaker_embedder,
             config=cfg,
             registry=self._speaker_registry,
             stream_id=self.lane.stream_id,
@@ -466,6 +481,20 @@ class LaneRuntime:
             self._kws_spotter.reload()
         except Exception:
             _logger.exception("KWS reload failed (lane=%d)", self.lane.stream_id)
+
+    def _apply_reload_speaker(self) -> None:
+        """REST 注册/删除声纹后热重载注册表（从磁盘重读，当前会话即时生效）。"""
+        if self._speaker_registry is None:
+            return
+        try:
+            self._speaker_registry.reload()
+            _logger.info(
+                "lane %d 声纹库已热重载（%d 人）",
+                self.lane.stream_id,
+                len(self._speaker_registry),
+            )
+        except Exception:
+            _logger.exception("声纹库热重载失败 (lane=%d)", self.lane.stream_id)
 
     async def _run_started(self, command: dict[str, Any]) -> None:
         self._reset_for_run()
@@ -827,6 +856,9 @@ class LaneRuntime:
             if command_type == "reload_kws":
                 self._apply_reload_kws()
                 continue
+            if command_type == "reload_speaker":
+                self._apply_reload_speaker()
+                continue
             if command_type in allowed:
                 return dict(command)
 
@@ -843,6 +875,9 @@ class LaneRuntime:
                 continue
             if command_type == "reload_kws":
                 self._apply_reload_kws()
+                continue
+            if command_type == "reload_speaker":
+                self._apply_reload_speaker()
                 continue
             if command_type not in {"stop", "shutdown"}:
                 continue
