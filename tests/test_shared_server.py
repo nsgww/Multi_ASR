@@ -67,20 +67,27 @@ def test_launch_command_uses_llama_server_smt_flags(tmp_path: Path):
     )
     server = tmp_path / "bin" / "llama-server"
 
-    command = build_launch_command(config, server)
+    command = build_launch_command(config, tmp_path / "generated", server)
 
     assert command[0] == str(server)
     assert command[command.index("-m") + 1] == str(
         tmp_path / "models" / "Qwen3-ASR-0.6B-text-q40.gguf"
     )
     assert command[command.index("--media-backend") + 1] == "smt"
-    assert command[command.index("--smt-config-dir") + 1] == str(tmp_path / "models")
+    assert command[command.index("--smt-config-dir") + 1] == str(
+        tmp_path / "generated"
+    )
     assert "--smt-multi-asr" in command
-    assert command[command.index("-np") + 1] == "4"
-    assert command[command.index("-c") + 1] == "8192"
-    assert command[command.index("-t") + 1] == "6"
-    assert command[command.index("-tb") + 1] == "6"
+    assert command[command.index("-np") + 1] == "6"
+    assert command[command.index("-c") + 1] == "16384"
+    assert command[command.index("-b") + 1] == "2048"
+    assert command[command.index("-ub") + 1] == "512"
+    assert command[command.index("-t") + 1] == "1"
+    assert command[command.index("-tb") + 1] == "1"
+    assert command[command.index("--threads-http") + 1] == "24"
+    assert command[command.index("--device") + 1] == "SPACEMIT0"
     assert "--warmup" in command
+    assert "--no-jinja" in command
 
 
 def test_launch_command_reflects_config_overrides(tmp_path: Path):
@@ -89,7 +96,9 @@ def test_launch_command_reflects_config_overrides(tmp_path: Path):
         shared_qwen=SharedQwenConfig(decoder_threads=4, n_parallel=2, n_ctx=4096),
     )
 
-    command = build_launch_command(config, tmp_path / "llama-server")
+    command = build_launch_command(
+        config, tmp_path / "generated", tmp_path / "llama-server"
+    )
 
     assert command[command.index("-np") + 1] == "2"
     assert command[command.index("-c") + 1] == "4096"
@@ -122,7 +131,7 @@ def test_scoped_cleanup_terminates_matching_pid(tmp_path, monkeypatch):
     server.write_text("binary")
     pid_path = tmp_path / "service.pid"
     pid_path.write_text("1234\n")
-    command = build_launch_command(config, server)
+    command = build_launch_command(config, tmp_path / "generated", server)
     signals: list[signal.Signals] = []
     monkeypatch.setattr(manager, "_pid_path", pid_path)
     monkeypatch.setattr(manager, "_read_cmdline", lambda pid: command)

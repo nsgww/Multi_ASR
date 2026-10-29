@@ -13,6 +13,7 @@ from multi_stream_asr.asr.offline.shared_server import (
     SHARED_CONFIG_DIR,
     SharedQwenServerManager,
     build_launch_command,
+    resolve_llama_server,
 )
 from multi_stream_asr.config import AppConfig
 
@@ -37,7 +38,7 @@ async def run_smoke(audio_path: Path, seconds: float) -> dict[str, object]:
     pcm = load_wav(audio_path, seconds)
     manager = SharedQwenServerManager(config)
     client = Qwen3AsrClient(shared=config.shared_qwen)
-    command = build_launch_command(config, SHARED_CONFIG_DIR)
+    command = build_launch_command(config, SHARED_CONFIG_DIR, resolve_llama_server())
     print("launch_command=" + json.dumps(command, ensure_ascii=False), flush=True)
     try:
         await asyncio.to_thread(manager.start)

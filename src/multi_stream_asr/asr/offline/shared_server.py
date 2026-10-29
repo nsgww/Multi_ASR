@@ -20,6 +20,46 @@ SHARED_CONFIG_DIR = Path("/tmp/multi-stream-asr/shared-qwen")
 SHARED_PID_PATH = SHARED_CONFIG_DIR / "llama-server.pid"
 SHARED_LOG_PATH = SHARED_CONFIG_DIR / "llama-server.log"
 
+# llama.cpp 0.2.1 把独立 `ggml-spacemit` 后端改成了 opt-in：registry 只有在
+# 该变量恰好为 "1" 时才报告设备。没有它 `--device SPACEMIT0` 会因参数解析
+# 失败（"invalid device: SPACEMIT0"）导致 llama-server 起不来。0.2.0 没有
+# 这个门控，设置该变量无害，因此这里始终导出并覆盖继承值。
+ENV_SPACEMIT_BACKEND = "GGML_SPACEMIT_BACKEND"
+SPACEMIT_BACKEND_ENABLED = "1"
+
+SUPPORT_LANGUAGES = (
+    "Chinese",
+    "English",
+    "Cantonese",
+    "Arabic",
+    "German",
+    "French",
+    "Spanish",
+    "Portuguese",
+    "Indonesian",
+    "Italian",
+    "Korean",
+    "Russian",
+    "Thai",
+    "Vietnamese",
+    "Japanese",
+    "Turkish",
+    "Hindi",
+    "Malay",
+    "Dutch",
+    "Swedish",
+    "Danish",
+    "Finnish",
+    "Polish",
+    "Czech",
+    "Filipino",
+    "Persian",
+    "Greek",
+    "Romanian",
+    "Hungarian",
+    "Macedonian",
+)
+
 
 @dataclass(frozen=True)
 class SharedQwenServerSpec:
@@ -44,13 +84,70 @@ def resolve_llama_server() -> Path:
     return server_path
 
 
-def build_launch_command(config: AppConfig, server_path: Path) -> list[str]:
-    """llama-server（--media-backend smt）启动命令。
+def build_shared_config(config: AppConfig) -> dict[str, object]:
+    """生成 --smt-config-dir 指向的 config.json（含 encoder 绑核）。
 
-    纠错后端用 llama-server 而非 llama-multi-asr：同模型同音频实测快约 14%
-    （1.31s vs 1.52s，2026-10-27 K3 实测）。--smt-config-dir 直接指向模型目录
-    （其中自带 config.json + encoder onnx）；--smt-multi-asr 必须打开，否则
-    输出会把 prompt 回声出来并截断。
+    encoder 的 intra-op 线程数与绑核（spacemit_ep_intra_thread_num /
+    spacemit_ep_intra_thread_affinity）在这里下发，与 decoder 核心集
+    （SPACEMIT_PERFER_CORE_ID）形成 2+6 不相交拆分。
+    """
+    model = config.models.offline_model
+    shared = config.shared_qwen
+    return {
+        "architectures": ["Qwen3ASRForConditionalGeneration"],
+        "support_languages": list(SUPPORT_LANGUAGES),
+        "audio_model": {
+            "frontend_model_path": str(model.model_dir / model.frontend_filename),
+            "backend_model_path": str(model.model_dir / model.backend_filename),
+            "spacemit_ep_intra_thread_num": shared.encoder_thread_num,
+            "spacemit_ep_inter_thread_num": 1,
+            "spacemit_ep_intra_thread_affinity": shared.encoder_affinity,
+            "num_mel_bins": 128,
+            "sample_rate": 16000,
+            "n_fft": 400,
+            "window_len": 400,
+            "hop_len": 160,
+            "chunk_frames": 100,
+            "chunk_tokens": 13,
+            "d_model": model.d_model,
+            "hidden_size": model.hidden_size,
+            "output_dim": model.output_dim,
+            "special_tokens": {
+                "audio_start_token": "<|audio_start|>",
+                "audio_end_token": "<|audio_end|>",
+                "audio_token": "<|audio_pad|>",
+                "audio_start_token_id": 151669,
+                "audio_end_token_id": 151670,
+                "audio_token_id": 151676,
+            },
+        },
+        "text_model": {
+            "model_path": str(model.model_dir / model.text_model_filename),
+            "context_size": 65536,
+            "logical_batch_size": 2048,
+            "predict_token": 256,
+            "vocab_size": 151936,
+            "hidden_size": model.hidden_size,
+        },
+        "prompt": {
+            "system_prefix_token": "<|im_start|>system",
+            "user_prefix_token": "<|im_start|>user",
+            "assistant_prefix_token": "<|im_start|>assistant",
+            "message_suffix_token": "<|im_end|>",
+            "asr_text_tag": "<asr_text>",
+        },
+    }
+
+
+def build_launch_command(
+    config: AppConfig, config_dir: Path, server_path: Path
+) -> list[str]:
+    """llama-server（--media-backend smt）启动命令（资源分配对齐性能调优线）。
+
+    -np 跟随 decoder 核数（SharedQwenConfig.n_parallel），-b/-ub 批大小、
+    --threads-http 并发 HTTP 线程、--device SPACEMIT0 强制落 SpacemiT 后端。
+    --smt-config-dir 指向自生成的 config.json（含 encoder 绑核）；
+    --smt-multi-asr 必须打开，否则输出会把 prompt 回声出来并截断。
     """
     shared = config.shared_qwen
     model = config.models.offline_model
@@ -61,7 +158,7 @@ def build_launch_command(config: AppConfig, server_path: Path) -> list[str]:
         "--media-backend",
         "smt",
         "--smt-config-dir",
-        str(model.model_dir),
+        str(config_dir),
         "--smt-multi-asr",
         "--host",
         shared.host,
@@ -71,13 +168,24 @@ def build_launch_command(config: AppConfig, server_path: Path) -> list[str]:
         str(shared.n_parallel),
         "-c",
         str(shared.n_ctx),
+        "-b",
+        str(shared.batch_size),
+        "-ub",
+        str(shared.ubatch_size),
         "-t",
         str(shared.decoder_threads),
         "-tb",
-        str(shared.decoder_threads),
+        str(shared.decoder_batch_threads),
+        "--threads-http",
+        str(shared.http_threads),
         "--cache-reuse",
         "0",
         "--warmup",
+        "--device",
+        shared.device,
+        "--no-jinja",
+        "--chat-template",
+        "chatml",
     ]
 
 
@@ -132,6 +240,7 @@ class SharedQwenServerManager:
         spec = self._build_spec()
         self._validate_files(spec)
         self._config_dir.mkdir(parents=True, exist_ok=True)
+        self._write_config()
         self._log_handle = self._log_path.open("w", encoding="utf-8")
         try:
             self._process = subprocess.Popen(
@@ -174,20 +283,33 @@ class SharedQwenServerManager:
 
     def _build_spec(self) -> SharedQwenServerSpec:
         shared = self._config.shared_qwen
+        env = os.environ.copy()
+        # decoder 核心集：ggml 设备只在这份核心列表上调度 worker 线程
+        env["SPACEMIT_PERFER_CORE_ID"] = shared.decoder_cores
+        # 0.2.1+ 用该变量门控独立后端；覆盖继承值，避免环境里残留
+        # GGML_SPACEMIT_BACKEND=0 把 decoder 静默压回 CPU 后端、A100 集群闲置
+        env[ENV_SPACEMIT_BACKEND] = SPACEMIT_BACKEND_ENABLED
         return SharedQwenServerSpec(
             port=shared.port,
             config_dir=self._config_dir,
             log_path=self._log_path,
             pid_path=self._pid_path,
-            env=os.environ.copy(),
-            command=build_launch_command(self._config, resolve_llama_server()),
+            env=env,
+            command=build_launch_command(
+                self._config, self._config_dir, resolve_llama_server()
+            ),
+        )
+
+    def _write_config(self) -> None:
+        (self._config_dir / "config.json").write_text(
+            json.dumps(build_shared_config(self._config), indent=2),
+            encoding="utf-8",
         )
 
     def _validate_files(self, spec: SharedQwenServerSpec) -> None:
         model = self._config.models.offline_model
         required = [
             Path(spec.command[0]),
-            model.model_dir / "config.json",
             *(model.model_dir / filename for filename in model.required_filenames),
         ]
         for path in required:

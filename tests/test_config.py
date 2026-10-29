@@ -67,10 +67,24 @@ def test_shared_qwen_defaults_match_validated_four_lane_service():
 
     assert shared.host == "127.0.0.1"
     assert shared.port == 8090
-    assert shared.decoder_threads == 6
-    assert shared.n_parallel == 4
-    assert shared.n_ctx == 8192
+    # 性能调优线 2+6 核心分离：encoder 绑 8-9，decoder 占 10-15
+    assert shared.encoder_thread_num == 2
+    assert shared.encoder_affinity == "8;9"
+    assert shared.decoder_cores == "10,11,12,13,14,15"
+    assert shared.decoder_threads == 1
+    assert shared.decoder_batch_threads == 1
+    assert shared.batch_size == 2048
+    assert shared.ubatch_size == 512
+    assert shared.http_threads == 24
+    assert shared.n_parallel == 6
+    assert shared.n_ctx == 16384
     assert shared.request_timeout_ms == 120000
+    assert shared.device == "SPACEMIT0"
+
+
+def test_shared_qwen_rejects_empty_device():
+    with pytest.raises(ValueError, match="device"):
+        SharedQwenConfig(device="")
 
 
 def test_app_config_exposes_shared_qwen_config():

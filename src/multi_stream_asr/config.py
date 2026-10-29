@@ -30,6 +30,53 @@ ZIPFORMER_WARMUP_AUDIO_PATH = (
     Path(__file__).resolve().parent / "assets" / "zipformer_warmup.wav"
 )
 
+ENV_QWEN_ENCODER_CORES = "MULTI_STREAM_ASR_QWEN_ENCODER_CORES"
+ENV_QWEN_DECODER_CORES = "MULTI_STREAM_ASR_QWEN_DECODER_CORES"
+# Encoder 和 decoder 默认各占 A100 集群的一半（不相交）：encoder intra-op
+# 线程绑 8-9，decoder（ggml 设备核心集，由 SPACEMIT_PERFER_CORE_ID 决定）
+# 占 10-15。两两者重叠会让 encoder 慢约 1.6x，并在持续负载下出现整跑停顿。
+# 2+6 是 8 lane 长音频（Zipformer 分段）下实测最优的拆分：encoder 串行化后
+# 2 核足够，多出的 6 个 decoder 核正是连续批处理解码的瓶颈（per-request
+# offline_rtf 1.034/1.052 (4+4) -> 0.815/0.791 (2+6)）。-np 跟随 decoder 核数。
+DEFAULT_QWEN_ENCODER_CORES = (8, 9)
+DEFAULT_QWEN_DECODER_CORES = (10, 11, 12, 13, 14, 15)
+
+
+def _env_core_ids(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Return CPU core ids from ``name`` (``"8,9"`` or ``"8;9"``), else default.
+
+    Lets a deployment re-split the 16-core SoC between the ASR encoder and the
+    shared Qwen decoder without rebuilding the package.
+    """
+    value = os.environ.get(name)
+    if not value or not value.strip():
+        return default
+    cores: list[int] = []
+    for part in value.replace(";", ",").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            core = int(token)
+        except ValueError as exc:
+            raise ValueError(
+                f"{name} must be a comma-separated list of core ids, got {value!r}"
+            ) from exc
+        if core < 0:
+            raise ValueError(f"{name} core ids must be non-negative, got {core!r}")
+        cores.append(core)
+    if not cores:
+        raise ValueError(f"{name} must list at least one core id, got {value!r}")
+    return tuple(cores)
+
+
+def qwen_encoder_cores() -> tuple[int, ...]:
+    return _env_core_ids(ENV_QWEN_ENCODER_CORES, DEFAULT_QWEN_ENCODER_CORES)
+
+
+def qwen_decoder_cores() -> tuple[int, ...]:
+    return _env_core_ids(ENV_QWEN_DECODER_CORES, DEFAULT_QWEN_DECODER_CORES)
+
 
 @dataclass(frozen=True)
 class KWSConfig:
@@ -214,14 +261,50 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class SharedQwenConfig:
+    """共享 Qwen3-ASR llama-server 设置（资源分配对齐性能调优线）。
+
+    核心拆分默认 2+6（encoder 绑 8-9，decoder 占 10-15），两者不相交：
+    重叠会让串行 encoder 慢约 1.6x 并在持续负载下整跑停顿。
+    ``decoder_threads`` 默认 1：SpacemiT 后端按 ``decoder_cores`` 列出的
+    每核自行调度 worker 线程（``QWEN_DECODER_THREADS`` 可覆盖）。
+    ``n_parallel`` 跟随 decoder 核数而非 lane 数：llama-server 给每个 slot
+    均分 ``n_ctx``，decoder 同时能处理的请求数受核数限制，多余 slot 只会在
+    忙解码器后排队。两个核心列表均可通过
+    ``MULTI_STREAM_ASR_QWEN_ENCODER_CORES`` / ``..._DECODER_CORES`` 按机重分。
+    """
+
     host: str = "127.0.0.1"
     port: int = 8090
-    # 纠错后端为系统 llama-server（--media-backend smt），encoder 线程/绑核
-    # 由模型目录自带 config.json 决定，这里只控制 decoder 线程数
-    decoder_threads: int = int(os.getenv("QWEN_DECODER_THREADS", "6"))
-    n_parallel: int = 8
-    n_ctx: int = 8192
+    encoder_thread_num: int = field(
+        default_factory=lambda: len(qwen_encoder_cores())
+    )
+    encoder_affinity: str = field(
+        default_factory=lambda: ";".join(str(c) for c in qwen_encoder_cores())
+    )
+    decoder_cores: str = field(
+        default_factory=lambda: ",".join(str(c) for c in qwen_decoder_cores())
+    )
+    decoder_threads: int = field(
+        default_factory=lambda: int(os.getenv("QWEN_DECODER_THREADS", "1"))
+    )
+    decoder_batch_threads: int = 1
+    batch_size: int = 2048
+    ubatch_size: int = 512
+    http_threads: int = 24
+    n_parallel: int = field(default_factory=lambda: len(qwen_decoder_cores()))
+    n_ctx: int = 16384
     request_timeout_ms: int = 120000
+    device: str = "SPACEMIT0"
+
+    def __post_init__(self) -> None:
+        # llama.cpp 0.2.x 要求每次启动都带 `--device SPACEMIT0`，否则模型
+        # 不会落到 ggml-spacemit 后端、SpacemiT 核心闲置。空字符串曾表示
+        # "省略该参数"，会静默退回 CPU 启动，因此直接拒绝。
+        if not isinstance(self.device, str) or not self.device.strip():
+            raise ValueError(
+                "device must be a non-empty device name (llama.cpp 0.2.x "
+                "requires --device SPACEMIT0)"
+            )
 
 
 @dataclass(frozen=True)
