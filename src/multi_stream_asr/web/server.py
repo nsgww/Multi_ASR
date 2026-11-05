@@ -74,6 +74,124 @@ class SummaryRequest(BaseModel):
     max_temperature: float = 0.5
 
 
+
+def _transcript_dirs(output_dir: Path) -> tuple[Path, Path]:
+    transcript_dir = (Path(output_dir) / "transcripts").resolve()
+    summary_dir = (Path(output_dir) / "summaries").resolve()
+    return transcript_dir, summary_dir
+
+
+def _resolve_transcript_file(output_dir: Path, filename: str) -> Path:
+    """校验并解析转写文件路径；非法/不存在抛 HTTPException。"""
+    if not filename or filename != Path(filename).name or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    transcript_dir, _ = _transcript_dirs(output_dir)
+    transcript_path = (transcript_dir / filename).resolve()
+    try:
+        if not transcript_path.is_relative_to(transcript_dir):
+            raise HTTPException(status_code=400, detail="invalid filename")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid filename") from exc
+    if not transcript_path.is_file():
+        raise HTTPException(status_code=404, detail="transcript not found")
+    return transcript_path
+
+
+def _summary_path_for(output_dir: Path, filename: str) -> Path:
+    _, summary_dir = _transcript_dirs(output_dir)
+    return summary_dir / f"{filename}.summary.json"
+
+
+def _transcript_preview(text: str, *, max_chars: int = 160) -> str:
+    lines: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        lines.append(s)
+        if sum(len(x) for x in lines) >= max_chars:
+            break
+    joined = " ".join(lines)
+    if len(joined) > max_chars:
+        return joined[: max_chars - 1] + "…"
+    return joined
+
+
+def _parse_speaker_stats(text: str) -> dict[str, Any]:
+    """从转写头注释解析说话人统计，如 ``# S1（28 句）``。"""
+    speakers: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("#"):
+            if s:
+                break
+            continue
+        # # S1（28 句） / # S1(28 句)
+        body = s.lstrip("#").strip()
+        if not body.upper().startswith("S"):
+            continue
+        name = body.split("（", 1)[0].split("(", 1)[0].strip()
+        count = None
+        for left, right in (("（", "）"), ("(", ")")):
+            if left in body and right in body:
+                mid = body.split(left, 1)[1].split(right, 1)[0]
+                digits = "".join(ch for ch in mid if ch.isdigit())
+                if digits:
+                    count = int(digits)
+                break
+        if name:
+            speakers.append({"id": name, "utterances": count})
+    return {
+        "speaker_count": len(speakers),
+        "speakers": speakers,
+    }
+
+
+def _meeting_item_from_transcript(
+    path: Path,
+    *,
+    output_dir: Path,
+    include_preview: bool = True,
+) -> dict[str, Any]:
+    filename = path.name
+    stat = path.stat()
+    summary_path = _summary_path_for(output_dir, filename)
+    has_summary = summary_path.is_file()
+    text = ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    speaker_stats = _parse_speaker_stats(text) if text else {"speaker_count": 0, "speakers": []}
+    line_count = sum(1 for line in text.splitlines() if line.strip() and not line.strip().startswith("#"))
+    item: dict[str, Any] = {
+        "id": filename.rsplit(".", 1)[0],
+        "filename": filename,
+        "title": filename.rsplit(".", 1)[0],
+        "bytes": int(stat.st_size),
+        "mtime": int(stat.st_mtime),
+        "mtime_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)),
+        "line_count": line_count,
+        "has_summary": has_summary,
+        "transcript_url": f"/v1/transcripts/{filename}",
+        "summary_url": f"/v1/transcripts/{filename}/summary",
+        **speaker_stats,
+    }
+    if include_preview:
+        item["preview"] = _transcript_preview(text)
+    if has_summary:
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                item["summary_provider"] = payload.get("provider")
+                summary_text = str(payload.get("summary") or payload.get("text") or "")
+                item["summary_preview"] = _transcript_preview(summary_text, max_chars=120)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            item["summary_provider"] = None
+            item["summary_preview"] = ""
+    return item
+
+
 class WordListRequest(BaseModel):
     """动态词表更新请求：kind 为 hotwords/sensitive/keywords，words 为词列表。
 
@@ -909,18 +1027,76 @@ def create_app(
             sensitive_filter=sensitive_filter,
         )
 
+    @app.get("/v1/transcripts")
+    async def list_transcripts(
+        limit: int = 50,
+        offset: int = 0,
+        q: str | None = None,
+    ) -> JSONResponse:
+        """历史会议/转写列表（按修改时间倒序）。
+
+        - ``limit``/``offset``：分页
+        - ``q``：可选，按文件名或正文预览子串过滤（简单包含匹配）
+        """
+        if limit < 1 or limit > 200:
+            raise HTTPException(status_code=400, detail="limit must be in [1, 200]")
+        if offset < 0:
+            raise HTTPException(status_code=400, detail="offset must be >= 0")
+
+        transcript_dir, _ = _transcript_dirs(app_config.output_dir)
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        files = sorted(
+            (p for p in transcript_dir.glob("*.txt") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        items: list[dict[str, Any]] = []
+        needle = (q or "").strip().lower()
+        for path in files:
+            item = _meeting_item_from_transcript(
+                path, output_dir=app_config.output_dir, include_preview=True
+            )
+            if needle:
+                blob = f"{item['filename']} {item.get('preview', '')} {item.get('summary_preview', '')}".lower()
+                if needle not in blob:
+                    continue
+            items.append(item)
+
+        total = len(items)
+        page = items[offset : offset + limit]
+        return JSONResponse(
+            content={
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "meetings": page,
+            }
+        )
+
+    @app.get("/v1/transcripts/{filename}/summary")
+    async def get_summary(filename: str) -> JSONResponse:
+        """读取已生成的纪要（不重新推理）；没有则 404。"""
+        _resolve_transcript_file(app_config.output_dir, filename)
+        summary_path = _summary_path_for(app_config.output_dir, filename)
+        if not summary_path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail="summary not found; POST /v1/transcripts/{filename}/summary to generate",
+            )
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=500, detail=f"invalid summary file: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=500, detail="invalid summary payload")
+        payload.setdefault("filename", filename)
+        return JSONResponse(content=payload)
+
     @app.post("/v1/transcripts/{filename}/summary")
     async def regenerate_summary(filename: str, request: SummaryRequest) -> JSONResponse:
-        transcript_dir = Path(app_config.output_dir) / "transcripts"
-        transcript_path = transcript_dir / filename
-        try:
-            transcript_path = transcript_path.resolve(strict=True)
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=404, detail="transcript not found") from exc
-        if not transcript_path.is_relative_to(transcript_dir.resolve()):
-            raise HTTPException(status_code=400, detail="invalid filename")
-        if not transcript_path.is_file():
-            raise HTTPException(status_code=404, detail="transcript file missing")
+        transcript_path = _resolve_transcript_file(app_config.output_dir, filename)
 
         if not summary_cfg.enabled:
             return JSONResponse(
@@ -944,14 +1120,15 @@ def create_app(
                 regenerate=request.regenerate,
             )
 
-            summary_dir = Path(app_config.output_dir) / "summaries"
-            summary_dir.mkdir(parents=True, exist_ok=True)
-            summary_path = summary_dir / f"{filename}.summary.json"
+            summary_path = _summary_path_for(app_config.output_dir, filename)
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = result.to_payload()
+            payload["filename"] = filename
             summary_path.write_text(
-                json.dumps(result.to_payload(), ensure_ascii=False, indent=2),
+                json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            return JSONResponse(content=result.to_payload())
+            return JSONResponse(content=payload)
         except Exception as exc:
             _logger.exception("summary regeneration failed")
             raise HTTPException(
@@ -962,17 +1139,26 @@ def create_app(
             await client.close()
 
     @app.get("/v1/transcripts/{filename}")
-    async def download_transcript(filename: str) -> FileResponse:
-        transcript_dir = Path(app_config.output_dir) / "transcripts"
-        transcript_path = transcript_dir / filename
-        try:
-            transcript_path = transcript_path.resolve(strict=True)
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=404, detail="transcript not found") from exc
-        if not transcript_path.is_relative_to(transcript_dir.resolve()):
-            raise HTTPException(status_code=400, detail="invalid filename")
-        if not transcript_path.is_file():
-            raise HTTPException(status_code=404, detail="transcript file missing")
-        return FileResponse(transcript_path, filename=filename)
+    async def download_transcript(
+        filename: str,
+        format: str = "text",
+    ) -> Response:
+        """获取转写全文。
+
+        - ``format=text``（默认）：纯文本文件下载/展示
+        - ``format=json``：元信息 + 全文，便于前端历史详情页
+        """
+        transcript_path = _resolve_transcript_file(app_config.output_dir, filename)
+        if format not in {"text", "json"}:
+            raise HTTPException(status_code=400, detail="format must be text or json")
+        if format == "text":
+            return FileResponse(transcript_path, filename=filename, media_type="text/plain; charset=utf-8")
+        text = transcript_path.read_text(encoding="utf-8", errors="replace")
+        meta = _meeting_item_from_transcript(
+            transcript_path, output_dir=app_config.output_dir, include_preview=False
+        )
+        meta["text"] = text
+        return JSONResponse(content=meta)
 
     return app
+
