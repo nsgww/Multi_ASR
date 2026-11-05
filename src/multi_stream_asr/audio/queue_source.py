@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import queue
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -9,6 +11,35 @@ import numpy as np
 from multi_stream_asr.audio.base import AudioSource
 from multi_stream_asr.audio.resample import SpeexResampler, SpeexResamplerError
 from multi_stream_asr.models import AudioFrame
+
+
+def _unblock_queue_with_none(audio_queue: Any) -> None:
+    """向音频队列塞 ``None``，解开 ``frames()`` 里阻塞的 ``get()``。"""
+    try:
+        audio_queue.put_nowait(None)
+        return
+    except (asyncio.QueueFull, queue.Full, ValueError, OSError):
+        pass
+    with contextlib.suppress(Exception):
+        audio_queue.get_nowait()
+    with contextlib.suppress(Exception):
+        audio_queue.put_nowait(None)
+
+
+def _drain_end_sentinels(audio_queue: Any) -> None:
+    """丢掉队列里残留的 ``None`` 结束哨兵，保留真实音频顺序。"""
+    kept: list[Any] = []
+    while True:
+        try:
+            item = audio_queue.get_nowait()
+        except (asyncio.QueueEmpty, queue.Empty, ValueError, OSError):
+            break
+        if item is None:
+            continue
+        kept.append(item)
+    for item in kept:
+        with contextlib.suppress(Exception):
+            audio_queue.put_nowait(item)
 
 
 class QueueAudioSource(AudioSource):
@@ -42,6 +73,7 @@ class QueueAudioSource(AudioSource):
         self._buffer = np.asarray([], dtype=np.float32)
         self._stopped = False
         self._finished = False
+        self._end_signaled = False
         self._frame_index = 0
         self._timestamp_ms = 0
         self._resampler: SpeexResampler | None = None
@@ -60,6 +92,11 @@ class QueueAudioSource(AudioSource):
     async def prepare(self) -> None:
         self._stopped = False
         self._finished = False
+        self._end_signaled = False
+        self._buffer = np.asarray([], dtype=np.float32)
+        self._frame_index = 0
+        self._timestamp_ms = 0
+        _drain_end_sentinels(self.audio_queue)
 
     def _convert(self, item: bytes | np.ndarray) -> np.ndarray | None:
         if isinstance(item, bytes):
@@ -78,6 +115,7 @@ class QueueAudioSource(AudioSource):
         while True:
             item = await asyncio.to_thread(self.audio_queue.get)
             if item is None:
+                self._end_signaled = True
                 break
 
             float_pcm = self._convert(item)
@@ -116,6 +154,9 @@ class QueueAudioSource(AudioSource):
     async def stop(self) -> None:
         self._stopped = True
         self._finished = True
+        if not self._end_signaled:
+            self._end_signaled = True
+            _unblock_queue_with_none(self.audio_queue)
         if self._resampler is not None:
             self._resampler.close()
             self._resampler = None
@@ -151,6 +192,7 @@ class AsyncQueueAudioSource(AudioSource):
         self._buffer = np.asarray([], dtype=np.float32)
         self._stopped = False
         self._finished = False
+        self._end_signaled = False
         self._frame_index = 0
         self._timestamp_ms = 0
         self._resampler: SpeexResampler | None = None
@@ -169,6 +211,11 @@ class AsyncQueueAudioSource(AudioSource):
     async def prepare(self) -> None:
         self._stopped = False
         self._finished = False
+        self._end_signaled = False
+        self._buffer = np.asarray([], dtype=np.float32)
+        self._frame_index = 0
+        self._timestamp_ms = 0
+        _drain_end_sentinels(self.audio_queue)
 
     def _convert(self, item: bytes | np.ndarray) -> np.ndarray | None:
         if isinstance(item, bytes):
@@ -185,10 +232,11 @@ class AsyncQueueAudioSource(AudioSource):
 
     async def frames(self) -> AsyncIterator[AudioFrame]:
         while True:
-            if self._stopped:
+            if self._stopped and self.audio_queue.empty():
                 break
             item = await self.audio_queue.get()
             if item is None:
+                self._end_signaled = True
                 break
 
             float_pcm = self._convert(item)
@@ -227,6 +275,9 @@ class AsyncQueueAudioSource(AudioSource):
     async def stop(self) -> None:
         self._stopped = True
         self._finished = True
+        if not self._end_signaled:
+            self._end_signaled = True
+            _unblock_queue_with_none(self.audio_queue)
         if self._resampler is not None:
             self._resampler.close()
             self._resampler = None

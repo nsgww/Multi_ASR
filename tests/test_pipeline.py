@@ -1010,6 +1010,40 @@ async def test_wait_for_offline_tail_cancels_remaining_work_on_timeout():
 
 
 @pytest.mark.asyncio
+async def test_finish_emits_lane_finished_when_offline_tail_times_out():
+    """finish 排空离线链超时时仍要发出 LANE_FINISHED，避免会话永远结束不了。"""
+    offline = CancellationAwareOfflineRecognizer()
+    bus = FrontendEventBus()
+    pipeline = LanePipeline(
+        stream_id=0,
+        online_recognizer=FakeOnlineRecognizer(
+            [make_online(text="hello", timestamp_ms=100, is_endpoint=True)]
+        ),
+        offline_recognizer=offline,
+        event_bus=bus,
+        segment_cache=SegmentCache(sample_rate=16000, capacity_seconds=15.0),
+        offline_tail_timeout_seconds=0.01,
+    )
+    source = FakeAudioSource(
+        [
+            make_frame(frame_index=0, samples=[0.1, 0.2], timestamp_ms=100),
+            AudioFrame.finish(0, 1, 200),
+        ]
+    )
+
+    await asyncio.wait_for(pipeline.run(source), timeout=2)
+    events = []
+    for _ in range(8):
+        events.append(await asyncio.wait_for(bus.next_event(), timeout=0.5))
+        if events[-1].status is EventStatus.LANE_FINISHED:
+            break
+
+    assert events[-1].status is EventStatus.LANE_FINISHED
+    assert offline.cancelled is True
+    assert pipeline.metrics.final_state is LaneFinalState.FINISHED
+
+
+@pytest.mark.asyncio
 async def test_qwen_failure_preserves_pending_and_allows_later_offline_requests():
     recognizer = FailOnceOfflineRecognizer()
     failures = []

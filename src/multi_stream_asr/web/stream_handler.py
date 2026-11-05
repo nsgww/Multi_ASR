@@ -390,7 +390,12 @@ class StreamHandler:
             except asyncio.CancelledError:
                 pass
         if self._session is not None:
-            await self._session_manager.stop_session(self._session)
+            if self._started and not self._finished_event.is_set():
+                with contextlib.suppress(Exception):
+                    self._session_manager.push_audio(self._session, None)
+            with contextlib.suppress(Exception):
+                await self._session_manager.stop_session(self._session)
+            self._session = None
         try:
             await self._websocket.close()
         except Exception:

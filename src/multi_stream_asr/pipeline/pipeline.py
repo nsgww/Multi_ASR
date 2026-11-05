@@ -89,6 +89,7 @@ class LanePipeline:
         on_kws: Callable[[KWSResult], None] | None = None,
         speaker_tracker: Any | None = None,
         on_speaker: Callable[[dict[str, Any]], None] | None = None,
+        offline_tail_timeout_seconds: float = 120.0,
     ) -> None:
         self.stream_id = stream_id
         self.online_recognizer = online_recognizer
@@ -100,6 +101,7 @@ class LanePipeline:
         self.on_speaker = on_speaker
         self._last_speaker: SpeakerInfo | None = None
         self.endpoint = endpoint or EndpointConfig()
+        self._offline_tail_timeout_seconds = max(0.0, float(offline_tail_timeout_seconds))
         self.latency_tracker = latency_tracker or LatencyTracker()
         self.rtf_tracker = rtf_tracker or RtfTracker()
         self.shared_timings_tracker = shared_timings_tracker or SharedTimingsTracker()
@@ -1040,9 +1042,19 @@ class LanePipeline:
         else:
             self.segment_cache.reset()
 
-        if self._offline_tasks:
-            await asyncio.gather(*tuple(self._offline_tasks), return_exceptions=True)
-            self._offline_tasks.clear()
+        # 长会话可能积压大量 Qwen 纠错；无总超时会让 finish 永远发不出
+        # LANE_FINISHED。超时后取消尾巴，仍尽量下发 remap + finished。
+        try:
+            await self.wait_for_offline_tail(
+                timeout_seconds=self._offline_tail_timeout_seconds
+            )
+        except TimeoutError:
+            _logger.warning(
+                "lane %d offline tail timed out after %.1fs on finish; "
+                "emitting lane_finished anyway",
+                self.stream_id,
+                self._offline_tail_timeout_seconds,
+            )
         # 二遍重聚类必须放在所有离线任务之后、LANE_FINISHED 之前，
         # 保证修正映射在会话结束前送到前端/落盘层。
         await self._emit_speaker_remap()

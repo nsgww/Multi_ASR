@@ -592,6 +592,9 @@ class LaneRuntime:
                 on_kws=report_kws,
                 speaker_tracker=self._create_speaker_tracker(),
                 on_speaker=report_speaker,
+                offline_tail_timeout_seconds=(
+                    self.app_config.shared_qwen.request_timeout_ms / 1000.0
+                ),
             )
             self._runtime_stop_requested = False
             source_ready = asyncio.Event()
@@ -881,18 +884,14 @@ class LaneRuntime:
                 continue
             if command_type not in {"stop", "shutdown"}:
                 continue
-            reason = str(command.get("reason", ""))
-            fatal_stop = command_type == "shutdown" or reason in {
-                "sibling_fatal",
-                "qwen_failure_threshold",
-            }
             self._runtime_stop_requested = True
             self._shutdown_requested = command_type == "shutdown"
             self._fatal_phase = "stop"
             if self._pipeline is not None:
                 self._pipeline.request_stop()
-                if fatal_stop:
-                    self._pipeline.cancel_offline_tasks()
+                # 用户 stop 也要取消离线尾巴，否则长会话积压会拖死收尾；
+                # 自然 finish（push None）仍走带超时的 _finish_after_offline。
+                self._pipeline.cancel_offline_tasks()
             if self._source is not None:
                 await self._source.stop()
             return

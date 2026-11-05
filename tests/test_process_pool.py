@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from multi_stream_asr.config import AppConfig, LaneConfig
+from multi_stream_asr.config import AppConfig, LaneConfig, SharedQwenConfig
 from multi_stream_asr.models import ASREvent, EventStatus
 from multi_stream_asr.pipeline.ipc import asr_event_to_payload
 from multi_stream_asr.pipeline.state import PipelineState
@@ -198,11 +198,54 @@ async def test_stop_session_sends_stop_and_releases_lane(manager) -> None:
             break
         await asyncio.sleep(0.02)
     assert any(c["type"] == "stop" for c in controller.commands)
+    # stop 前会先塞 None 解阻音频队列
+    assert controller.audio_queue.get_nowait() is None
     controller.emit_lifecycle("lane_finished")
     await asyncio.wait_for(stop_task, timeout=2)
 
     assert manager.active_sessions == 0
     assert session.lane_id in manager._available_lanes
+
+    await manager.unload_models()
+
+
+async def test_stop_session_timeout_retires_stuck_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(process_pool, "LaneProcessController", FakeLaneController)
+    config = AppConfig(
+        max_concurrent_sessions=2,
+        output_dir=tmp_path / "out",
+        shared_qwen=SharedQwenConfig(request_timeout_ms=20),
+    )
+    manager = ProcessPoolSessionManager(config, FrontendEventBus(), fake=True)
+    manager._lifecycle_timeout_seconds = 0.05
+    await manager.load_models()
+    session = await manager.create_session(lambda e: None)
+    lane_id = session.lane_id
+    controller = controllers_of(manager)[lane_id]
+    await _start_and_signal_started(manager, session)
+
+    # 故意不发 lane_finished，触发超时强杀
+    await asyncio.wait_for(manager.stop_session(session), timeout=5)
+
+    assert manager.active_sessions == 0
+    assert lane_id not in manager._available_lanes
+    assert lane_id not in manager._controllers
+    assert controller.is_alive() is False
+    assert manager.alive_lanes == 1
+
+    await manager.unload_models()
+
+
+async def test_lane_failed_sets_finished_event(manager) -> None:
+    await manager.load_models()
+    session = await manager.create_session(lambda e: None)
+    controller = controllers_of(manager)[session.lane_id]
+    await _start_and_signal_started(manager, session)
+
+    controller.emit_lifecycle("lane_failed", message="boom")
+    await asyncio.wait_for(session.finished_event.wait(), timeout=2)
 
     await manager.unload_models()
 

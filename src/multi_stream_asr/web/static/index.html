@@ -449,6 +449,8 @@
       };
       let loadPhaseTimer = null;
       let completionRefreshTimer = null;
+      let completionWaitStartedAt = null;
+      const COMPLETION_WAIT_TIMEOUT_MS = 130000;
 
       function laneKey(streamId, sentenceId) {
         return `${streamId}:${sentenceId}`;
@@ -996,14 +998,24 @@
 
       async function waitForRecognitionCompletion() {
         completionRefreshTimer = null;
+        if (completionWaitStartedAt === null) {
+          completionWaitStartedAt = Date.now();
+        }
         try {
           await refreshOperationalState();
           if (["starting", "running", "stopping"].includes(appState.state)) {
+            if (Date.now() - completionWaitStartedAt > COMPLETION_WAIT_TIMEOUT_MS) {
+              completionWaitStartedAt = null;
+              setOperation("Recognition stop timed out; refreshed service state.");
+              return;
+            }
             completionRefreshTimer = window.setTimeout(waitForRecognitionCompletion, 100);
             return;
           }
+          completionWaitStartedAt = null;
           if (appState.state === "loaded") setOperation("Recognition completed.");
         } catch (error) {
+          completionWaitStartedAt = null;
           showError(error.message);
         }
       }
@@ -1036,6 +1048,7 @@
       function handleLaneFinished(event) {
         appState.finishedLanes.add(event.stream_id);
         if (appState.finishedLanes.size === appState.lanes && completionRefreshTimer === null) {
+          completionWaitStartedAt = Date.now();
           completionRefreshTimer = window.setTimeout(waitForRecognitionCompletion, 0);
         }
       }
@@ -1205,10 +1218,20 @@
           setOperation("Stopping recognition...");
           renderStatus();
           await postJson("/api/recognition/stop");
-          setOperation("Recognition stopped.");
+          await refreshOperationalState();
+          if (["starting", "running", "stopping"].includes(appState.state)) {
+            if (completionRefreshTimer === null) {
+              completionWaitStartedAt = Date.now();
+              completionRefreshTimer = window.setTimeout(waitForRecognitionCompletion, 0);
+            }
+            setOperation("Recognition stopping...");
+          } else {
+            completionWaitStartedAt = null;
+            setOperation("Recognition stopped.");
+          }
         } catch (error) {
           showError(error.message);
-          await loadHealth();
+          await refreshOperationalState();
         }
       });
 

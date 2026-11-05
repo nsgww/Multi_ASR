@@ -280,12 +280,15 @@ class ProcessPoolSessionManager:
         if session.lane_id not in self._sessions:
             return
         controller = session.controller
+        retired = False
         if (
             session.started
             and not session.finished_event.is_set()
             and controller.is_alive()
         ):
-            # 只在 lane 确实跑过且未自然结束时发 stop；空闲 lane 收到 stop 会退出。
+            # 先塞结束帧解阻音频 get()，再发 stop；空闲 lane 收到 stop 会退出。
+            with contextlib.suppress(Exception):
+                self.push_audio(session, None)
             try:
                 controller.send({"type": "stop", "reason": reason})
             except Exception:
@@ -297,15 +300,52 @@ class ProcessPoolSessionManager:
                 )
             except asyncio.TimeoutError:
                 _logger.warning(
-                    "lane %d did not finish within timeout on stop (%s)",
+                    "lane %d did not finish within timeout on stop (%s); retiring process",
                     session.lane_id,
                     reason,
                 )
+                await self._retire_stuck_lane(session.lane_id, controller)
+                retired = True
+                session.finished_event.set()
         session.started = False
         self._sessions.pop(session.lane_id, None)
-        if controller.is_alive() and session.lane_id not in self._available_lanes:
+        if (
+            not retired
+            and controller.is_alive()
+            and session.lane_id not in self._available_lanes
+        ):
             self._available_lanes.append(session.lane_id)
             self._available_lanes.sort()
+
+    async def _retire_stuck_lane(
+        self, lane_id: int, controller: LaneProcessController
+    ) -> None:
+        """超时仍未结束的 lane 直接杀掉，避免脏进程被放回池里卡死下次 start。"""
+        reader = self._reader_tasks.pop(lane_id, None)
+        if reader is not None and not reader.done():
+            reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reader
+        with contextlib.suppress(Exception):
+            controller.send({"type": "shutdown"})
+        with contextlib.suppress(Exception):
+            await controller.terminate_then_kill(
+                terminate_timeout=5.0,
+                kill_timeout=2.0,
+            )
+        with contextlib.suppress(Exception):
+            controller.close_process()
+        with contextlib.suppress(Exception):
+            controller.close_queues()
+        self._controllers.pop(lane_id, None)
+        if lane_id in self._available_lanes:
+            self._available_lanes.remove(lane_id)
+        _logger.error(
+            "lane %d process retired after stop timeout; "
+            "pool capacity is now %d until models are reloaded",
+            lane_id,
+            self.alive_lanes,
+        )
 
     def push_audio(self, session: Session, data: bytes | np.ndarray | None) -> None:
         audio_queue = session.controller.audio_queue
@@ -425,3 +465,5 @@ class ProcessPoolSessionManager:
                 session.finished_event.set()
         elif state in ("lane_failed", "lane_stopped"):
             self._load_event.set()
+            if session is not None:
+                session.finished_event.set()
