@@ -23,6 +23,7 @@ from multi_stream_asr.asr.online.base import OnlineRecognizer
 from multi_stream_asr.audio.base import AudioSource
 from multi_stream_asr.buffer.audio_queue import OnlineFrameQueue
 from multi_stream_asr.buffer.segment_cache import SegmentCache
+from multi_stream_asr.models import AudioFrame
 from multi_stream_asr.config import EndpointConfig, DEFAULT_VAD_MODEL_DIR
 from multi_stream_asr.log.lane_artifacts import DetailJsonlWriter
 from multi_stream_asr.log.metrics import (
@@ -89,7 +90,11 @@ class LanePipeline:
         on_kws: Callable[[KWSResult], None] | None = None,
         speaker_tracker: Any | None = None,
         on_speaker: Callable[[dict[str, Any]], None] | None = None,
-        offline_tail_timeout_seconds: float = 120.0,
+        # 自然 finish 排空离线尾巴的上限；用户点结束会再走 stop 取消积压。
+        # 默认 25s，避免长会议收尾像死机（可用 OFFLINE_TAIL_TIMEOUT_SECONDS 覆盖）。
+        offline_tail_timeout_seconds: float = float(
+            os.getenv("OFFLINE_TAIL_TIMEOUT_SECONDS", "25")
+        ),
     ) -> None:
         self.stream_id = stream_id
         self.online_recognizer = online_recognizer
@@ -427,6 +432,18 @@ class LanePipeline:
         if start_run is not None:
             self._run_async_in_thread(start_run())
 
+        # 组播源硬停（如对端关麦后完全停止推流）时，VAD 等不到尾音静音，
+        # 未收尾的句子会永远卡在"识别中"。断流超过该时长就注入合成静音，
+        # 让 endpoint 规则自然收尾；恢复推流后回到真实帧。
+        starve_after_seconds = 1.2
+        silence_chunk_ms = 100
+        silence_samples = 16000 * silence_chunk_ms // 1000
+        starve_silence_chunks = 10  # 每次注入 1.0s 静音（> rule2 尾音 0.7s）
+        last_frame_at = self._monotonic()
+        last_stream_id = 0
+        last_frame_index = 0
+        last_timestamp_ms = 0
+
         while not stop_requested.is_set():
             frame = frame_queue.wait_get(timeout=0.1)
             if frame is None:
@@ -434,9 +451,36 @@ class LanePipeline:
                     if source_error:
                         raise source_error[0]
                     break
+                if self._monotonic() - last_frame_at > starve_after_seconds:
+                    for _ in range(starve_silence_chunks):
+                        if stop_requested.is_set():
+                            break
+                        last_frame_index += 1
+                        last_timestamp_ms += silence_chunk_ms
+                        silence = AudioFrame(
+                            stream_id=last_stream_id,
+                            frame_index=last_frame_index,
+                            pcm=np.zeros(silence_samples, dtype=np.float32),
+                            timestamp_ms=last_timestamp_ms,
+                        )
+                        self.segment_cache.put(silence)
+                        if self._endpoint_mode == "vad":
+                            self._paraformer_frame(silence)
+                            continue
+                        recognition = self._run_async_in_thread(
+                            self.online_recognizer.accept(silence)
+                        )
+                        if recognition is not None:
+                            self._handle_online_result(recognition)
+                    last_frame_at = self._monotonic()
                 continue
             if stop_requested.is_set():
                 break
+
+            last_frame_at = self._monotonic()
+            last_stream_id = frame.stream_id
+            last_frame_index = frame.frame_index
+            last_timestamp_ms = frame.timestamp_ms
 
             if frame.is_finish:
                 if self._endpoint_mode == "vad":
