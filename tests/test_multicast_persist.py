@@ -38,6 +38,14 @@ class _StubSessionManager:
     def signal_finish(self, session) -> None:  # noqa: ANN001
         self.push_audio(session, None)
 
+    def signal_finish_cancel(self, session) -> None:  # noqa: ANN001
+        pass
+
+    async def await_finish(self, session) -> bool:  # noqa: ANN001
+        self.signal_finish(session)
+        session.finished_event.set()
+        return True
+
     async def stop_session(self, session, **kwargs) -> None:  # noqa: ANN001
         pass
 

@@ -258,14 +258,9 @@ class MulticastRuntimeRegistry:
                     await job.audio_task
             with contextlib.suppress(Exception):
                 await job.audio_source.stop()
-            # 与 /ws/stream 一致：结束帧 + stop，避免长会议排空整条 Qwen 队列
-            self._session_manager.signal_finish(job.session)
-            try:
-                await asyncio.wait_for(
-                    job.session.finished_event.wait(),
-                    timeout=self._session_manager.finish_grace_seconds,
-                )
-            except asyncio.TimeoutError:
+            # 先自然收尾；未完成再 stop 砍积压（已定稿时通常 1~2s 内结束）
+            finished = await self._session_manager.await_finish(job.session)
+            if not finished:
                 _logger.warning("multicast job finish timed out %s:%d", group, port)
             await self._session_manager.stop_session(
                 job.session, reason="finish", wait_timeout=5.0

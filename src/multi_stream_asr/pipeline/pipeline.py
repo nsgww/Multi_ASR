@@ -1004,12 +1004,28 @@ class LanePipeline:
 
         通过 ``on_speaker`` 回调把 ``旧标签 -> 新标签`` 映射发给前端/落盘层；
         消费方必须**原子地**套用整张表（不能链式逐条替换）。
+
+        长会议句数多时 AHC 可能很慢；默认最多等 ``SPEAKER_RESEGMENT_TIMEOUT_SECONDS``
+        （3s），超时跳过 remap，避免结束卡十几二十秒。
         """
         tracker = self.speaker_tracker
         if tracker is None or self.on_speaker is None:
             return
+        timeout = max(
+            0.1, float(os.getenv("SPEAKER_RESEGMENT_TIMEOUT_SECONDS", "3"))
+        )
         try:
-            mapping = await asyncio.to_thread(tracker.resegment)
+            mapping = await asyncio.wait_for(
+                asyncio.to_thread(tracker.resegment),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            _logger.warning(
+                "二遍重聚类超时 %.1fs，跳过 remap lane=%d",
+                timeout,
+                self.stream_id,
+            )
+            return
         except Exception:
             _logger.exception("二遍重聚类失败 lane=%d", self.stream_id)
             return

@@ -239,16 +239,10 @@ class StreamHandler:
         if notify:
             # 立刻告诉前端「正在收尾」，避免长会议点结束后一直转圈像死机
             await self._send(msg.status_message("finalizing", lane_id=lane_id))
-        # 结束帧 + stop：取消 Qwen 积压，否则 1~2 小时会话可能要等整队校正
-        self._session_manager.signal_finish(session)
-        try:
-            await asyncio.wait_for(
-                session.finished_event.wait(),
-                timeout=self._session_manager.finish_grace_seconds,
-            )
-        except asyncio.TimeoutError:
-            if notify:
-                await self._send(msg.error_message("transcription finish timed out"))
+        # 先自然收尾；有积压再 stop。已全部定稿时通常秒级结束，不必干等 grace。
+        finished = await self._session_manager.await_finish(session)
+        if not finished and notify:
+            await self._send(msg.error_message("transcription finish timed out"))
         self._finished_event.set()
         # Save transcript and optionally generate summary before releasing lane.
         transcript_path = await self._save_transcript()
@@ -279,13 +273,8 @@ class StreamHandler:
             await self._send(
                 msg.status_message("finalizing", lane_id=self._session.lane_id)
             )
-            self._session_manager.signal_finish(self._session)
-            try:
-                await asyncio.wait_for(
-                    self._session.finished_event.wait(),
-                    timeout=self._session_manager.finish_grace_seconds,
-                )
-            except asyncio.TimeoutError:
+            finished = await self._session_manager.await_finish(self._session)
+            if not finished:
                 await self._send(msg.error_message("finalize timed out"))
                 return
         if self._session is not None:

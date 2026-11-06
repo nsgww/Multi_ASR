@@ -638,24 +638,30 @@ class LaneRuntime:
                 snapshot_task=snapshot_task,
             )
 
+            # 用户 stop/finish 已 cancel 离线；不必再按单次 Qwen 120s 等尾巴。
+            qwen_timeout = self.app_config.shared_qwen.request_timeout_ms / 1000.0
+            tail_timeout = (
+                min(2.0, qwen_timeout)
+                if self._runtime_stop_requested
+                else qwen_timeout
+            )
             tail_task = asyncio.create_task(
-                self._pipeline.wait_for_offline_tail(
-                    timeout_seconds=self.app_config.shared_qwen.request_timeout_ms / 1000.0
-                )
+                self._pipeline.wait_for_offline_tail(timeout_seconds=tail_timeout)
             )
             tail_result, tail_cancellation = await self._await_task_quiescent(tail_task)
             if run_error is None and tail_cancellation is not None:
                 run_error = tail_cancellation
             tail_error = tail_result if isinstance(tail_result, BaseException) else None
 
-            if run_error is not None:
-                raise run_error
-            if tail_error is not None:
-                raise tail_error
+            # stop 路径也必须发 lane_finished，否则 Web 会干等满 FINISH_GRACE。
             self.send("metrics_final", self._metrics_payload(include_paths=True))
             if self._artifacts_created:
                 self.send("paths", self._paths_payload())
             self.send("lifecycle", {"state": "lane_finished", "message": ""})
+            if run_error is not None:
+                raise run_error
+            if tail_error is not None:
+                raise tail_error
         except BaseException as exc:
             operation_error = exc
             operation_traceback = exc.__traceback__

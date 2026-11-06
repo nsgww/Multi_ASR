@@ -81,6 +81,11 @@ class ProcessPoolSessionManager:
         self._finish_grace_seconds = float(
             os.getenv("FINISH_GRACE_SECONDS", "25")
         )
+        # 先只推结束帧做自然收尾；这么多秒内 lane_finished 不到再发 stop 砍积压。
+        # 已全部定稿时通常 1s 内结束，避免一上来 stop 把收尾掐掉后干等满 grace。
+        self._finish_quick_seconds = float(
+            os.getenv("FINISH_QUICK_SECONDS", "2")
+        )
 
     @property
     def state(self) -> PipelineState:
@@ -385,21 +390,64 @@ class ProcessPoolSessionManager:
     def finish_grace_seconds(self) -> float:
         return max(1.0, float(self._finish_grace_seconds))
 
-    def signal_finish(self, session: Session) -> None:
-        """结束本轮：塞结束帧，并立刻 stop 取消离线积压。
+    @property
+    def finish_quick_seconds(self) -> float:
+        return max(0.1, float(self._finish_quick_seconds))
 
-        只 ``push None`` 会走自然收尾，长会议要把整条 Qwen 队列排完才
-        ``lane_finished``，前端会长时间转圈。这里叠加 ``stop``，让 lane
-        ``cancel_offline_tasks``，在宽限内尽快结束。
+    def signal_finish(self, session: Session) -> None:
+        """只塞结束帧，让 lane 走自然收尾（含尾句 FINAL / 声纹 remap）。
+
+        有 Qwen 积压时请用 ``await_finish``：短暂等待后会再发 ``stop`` 取消尾巴。
         """
         with contextlib.suppress(Exception):
             self.push_audio(session, None)
+
+    def signal_finish_cancel(self, session: Session) -> None:
+        """取消离线积压，促使 lane 尽快 ``lane_finished``。"""
         try:
             session.controller.send({"type": "stop", "reason": "finish"})
         except Exception:
             _logger.exception(
                 "failed to signal finish/stop to lane %d", session.lane_id
             )
+
+    async def await_finish(self, session: Session) -> bool:
+        """结束会话：先自然收尾，超时再 stop；总等待不超过 ``finish_grace_seconds``。
+
+        Returns:
+            ``True`` 若在宽限内收到 ``lane_finished``，否则 ``False``。
+        """
+        if session.finished_event.is_set():
+            return True
+
+        grace = self.finish_grace_seconds
+        quick = min(self.finish_quick_seconds, grace)
+        started = time.monotonic()
+        self.signal_finish(session)
+
+        try:
+            await asyncio.wait_for(session.finished_event.wait(), timeout=quick)
+            return True
+        except asyncio.TimeoutError:
+            pass
+
+        _logger.info(
+            "lane %d still finishing after %.1fs; cancelling offline backlog",
+            session.lane_id,
+            time.monotonic() - started,
+        )
+        self.signal_finish_cancel(session)
+        remaining = max(0.1, grace - (time.monotonic() - started))
+        try:
+            await asyncio.wait_for(session.finished_event.wait(), timeout=remaining)
+            return True
+        except asyncio.TimeoutError:
+            _logger.warning(
+                "lane %d finish timed out after %.1fs",
+                session.lane_id,
+                time.monotonic() - started,
+            )
+            return False
 
     # -- lane event reader -------------------------------------------------
 
