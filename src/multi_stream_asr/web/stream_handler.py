@@ -234,18 +234,22 @@ class StreamHandler:
     async def _finish_pipeline(self, *, notify: bool = True) -> None:
         if self._session is None or not self._started or self._finished_event.is_set():
             return
-        self._session_manager.push_audio(self._session, None)
         session = self._session
+        lane_id = session.lane_id
+        if notify:
+            # 立刻告诉前端「正在收尾」，避免长会议点结束后一直转圈像死机
+            await self._send(msg.status_message("finalizing", lane_id=lane_id))
+        # 结束帧 + stop：取消 Qwen 积压，否则 1~2 小时会话可能要等整队校正
+        self._session_manager.signal_finish(session)
         try:
             await asyncio.wait_for(
                 session.finished_event.wait(),
-                timeout=self._session_manager._lifecycle_timeout_seconds,
+                timeout=self._session_manager.finish_grace_seconds,
             )
         except asyncio.TimeoutError:
             if notify:
                 await self._send(msg.error_message("transcription finish timed out"))
         self._finished_event.set()
-        lane_id = session.lane_id
         # Save transcript and optionally generate summary before releasing lane.
         transcript_path = await self._save_transcript()
         if transcript_path is not None:
@@ -253,9 +257,11 @@ class StreamHandler:
             summary = await self._maybe_generate_summary()
             if summary is not None:
                 await self._send(msg.summary_message(summary, lane_id=lane_id))
-        # Release the lane immediately; the WebSocket stays open.
+        # 宽限已等过；释放时再短等几秒，避免二次卡满 lifecycle 超时
         with contextlib.suppress(Exception):
-            await self._session_manager.stop_session(session)
+            await self._session_manager.stop_session(
+                session, reason="finish", wait_timeout=5.0
+            )
         self._session = None
         self._started = False
         self._paused = False
@@ -273,11 +279,11 @@ class StreamHandler:
             await self._send(
                 msg.status_message("finalizing", lane_id=self._session.lane_id)
             )
-            self._session_manager.push_audio(self._session, None)
+            self._session_manager.signal_finish(self._session)
             try:
                 await asyncio.wait_for(
                     self._session.finished_event.wait(),
-                    timeout=self._session_manager._lifecycle_timeout_seconds,
+                    timeout=self._session_manager.finish_grace_seconds,
                 )
             except asyncio.TimeoutError:
                 await self._send(msg.error_message("finalize timed out"))

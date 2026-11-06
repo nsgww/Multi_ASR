@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +18,6 @@ from multi_stream_asr.audio.multicast import (
 from multi_stream_asr.session.process_pool import ProcessPoolSessionManager
 from multi_stream_asr.web import messages as msg
 from multi_stream_asr.web.multicast_runtime import MulticastJob, MulticastRuntimeRegistry
-from multi_stream_asr.web.transcript_buffer import TranscriptBuffer, consume_event
 from multi_stream_asr.web.wakeup_gate import WakeupGate, WakeupSettings
 from multi_stream_asr.web.ws_utils import is_client_disconnect
 
@@ -32,6 +30,9 @@ class MulticastHandler:
     The UDP→ASR job is owned by ``MulticastRuntimeRegistry`` and survives
     WebSocket disconnect. Only an explicit ``finish`` (or server shutdown)
     stops and releases the lane.
+
+    Transcript text lives on the job (not this handler), so disconnect does
+    not lose finals produced while no client is attached.
     """
 
     def __init__(
@@ -76,7 +77,6 @@ class MulticastHandler:
         self._send_task: asyncio.Task[None] | None = None
         self._closed = False
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._transcript = TranscriptBuffer()
         self._transcript_path: Path | None = None
 
     async def run(self) -> None:
@@ -109,6 +109,8 @@ class MulticastHandler:
                     message="multicast job already running; receiving events",
                 )
             )
+            # 把断线期间（及更早）已定稿的句子补发给新连接
+            await self._replay_job_transcript(existing)
         else:
             await self._send(msg.status_message("ready", message="send start to listen"))
 
@@ -120,6 +122,19 @@ class MulticastHandler:
             )
         finally:
             await self._cleanup()
+
+    async def _replay_job_transcript(self, job: MulticastJob) -> None:
+        replayed = 0
+        for message in job.replay_messages():
+            await self._send(message)
+            replayed += 1
+        if replayed:
+            _logger.info(
+                "multicast replayed %d event(s) to client %s:%d",
+                replayed,
+                self._group,
+                self._port,
+            )
 
     async def _receive_loop(self) -> None:
         try:
@@ -198,6 +213,8 @@ class MulticastHandler:
                 )
             )
             return
+
+        preexisting = self._runtime.get(self._group, self._port)
         try:
             job = await self._runtime.start_job(
                 group=self._group,
@@ -217,10 +234,16 @@ class MulticastHandler:
         self._job = job
         self._attached = True
         self._enable_summary = False
-        self._transcript.reset()
         self._transcript_path = None
-        self._gate.reset()
-        job.wakeup_active = False
+        reattached = preexisting is not None and not preexisting.finished
+        if reattached:
+            # 复用仍在跑的 job：不清缓冲、不改 wakeup_active，补发已有定稿
+            if job.wakeup_active:
+                self._gate.activate()
+            await self._replay_job_transcript(job)
+        else:
+            self._gate.reset()
+            job.wakeup_active = False
         joined = ",".join(job.audio_source._joined_ifs) or "?"
         await self._send(
             msg.status_message(
@@ -278,16 +301,20 @@ class MulticastHandler:
 
     async def _handle_finish(self) -> None:
         self._explicit_finish = True
+        lane_hint = self._job.session.lane_id if self._job is not None else None
+        await self._send(
+            msg.status_message("finalizing", lane_id=lane_hint)
+        )
         # 先收尾再 detach：收尾阶段 pipeline 还会吐最后一句 FINAL 和
-        # speaker_remap，提前 detach 会把这些事件丢掉（落盘就会缺尾句/说话人）。
+        # speaker_remap；job 缓冲会先记下这些事件再写盘。
         job = await self._runtime.stop_job(self._group, self._port)
         if self._attached:
             self._runtime.detach(self._group, self._port, self._on_job_event)
             self._attached = False
         lane_id = job.session.lane_id if job is not None else None
         self._job = None
-        # Save transcript and optionally generate summary before returning ready.
-        transcript_path = await self._save_transcript(lane_id) if lane_id is not None else None
+        transcript_path = job.transcript_path if job is not None else None
+        self._transcript_path = transcript_path
         if transcript_path is not None and lane_id is not None:
             await self._send(msg.saved_message(lane_id, str(transcript_path)))
             summary = await self._maybe_generate_summary()
@@ -311,15 +338,13 @@ class MulticastHandler:
 
     def _on_job_event(self, message: dict[str, Any]) -> None:
         # ASR/KWS callbacks may arrive from worker threads.
+        # 文本已在 runtime._fanout 写入 job 缓冲；这里只做门控与下行推送。
         if self._loop is None:
             return
         for m in self._gate.process(message):
-            if m.get("type") == "transcript":
-                seg = m.get("segment")
-                if isinstance(seg, dict) and seg.get("text"):
-                    m = dict(m, segment=dict(seg, text=self._sensitive_filter.filter(seg["text"])))
-            # final 文本与 speaker_remap 都喂给同一个缓冲，落盘时统一渲染
-            consume_event(self._transcript, m)
+            if m.get("type") == "status" and m.get("status") == "sleep":
+                if self._job is not None:
+                    self._job.wakeup_active = False
             if self._gate.active and self._job is not None and not self._job.wakeup_active:
                 self._job.wakeup_active = True
             self._loop.call_soon_threadsafe(self._enqueue, m)
@@ -332,23 +357,6 @@ class MulticastHandler:
 
     async def _send(self, message: dict[str, Any]) -> None:
         await self._outgoing_queue.put(message)
-
-    def _transcript_filename(self, lane_id: int) -> str:
-        ts = int(time.time() * 1000)
-        return f"spacemit-asr-lane{lane_id}-{ts}.txt"
-
-    async def _save_transcript(self, lane_id: int) -> Path | None:
-        if not self._transcript:
-            return None
-        full_text = self._transcript.render()
-        if not full_text:
-            return None
-        transcript_dir = self._output_dir / "transcripts"
-        transcript_dir.mkdir(parents=True, exist_ok=True)
-        path = transcript_dir / self._transcript_filename(lane_id)
-        await asyncio.to_thread(path.write_text, full_text, encoding="utf-8")
-        self._transcript_path = path
-        return path
 
     async def _maybe_generate_summary(self) -> dict[str, Any] | None:
         if not self._enable_summary:

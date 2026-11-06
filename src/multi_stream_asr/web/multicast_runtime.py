@@ -5,13 +5,16 @@ import contextlib
 import ipaddress
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from multi_stream_asr.asr.text_filter import SensitiveWordFilter
 from multi_stream_asr.audio.multicast import MulticastAudioSource
 from multi_stream_asr.session.process_pool import ProcessPoolSessionManager, Session
+from multi_stream_asr.web.transcript_buffer import TranscriptBuffer
 
 _logger = logging.getLogger(__name__)
 
@@ -30,6 +33,29 @@ class MulticastJob:
     listeners: set[EventSink] = field(default_factory=set)
     finished: bool = False
     wakeup_active: bool = False
+    # 转写挂在 job 上：WS 断线后任务继续跑时仍记句，重连可回放、结束可全文落盘
+    transcript: TranscriptBuffer = field(default_factory=TranscriptBuffer)
+    transcript_path: Path | None = None
+    _replay: list[dict[str, Any]] = field(default_factory=list)
+
+    def record_event(self, message: dict[str, Any]) -> None:
+        """把 final / speaker_remap 记入缓冲与回放队列（无 listener 也记）。"""
+        msg_type = message.get("type")
+        if msg_type == "transcript":
+            if not self.transcript.add_transcript(message):
+                return
+            self._replay.append(_copy_event(message))
+            return
+        if msg_type == "speaker_remap":
+            if not self.transcript.add_speaker_remap(message):
+                return
+            self._replay = [
+                item for item in self._replay if item.get("type") != "speaker_remap"
+            ]
+            self._replay.append(_copy_event(message))
+
+    def replay_messages(self) -> list[dict[str, Any]]:
+        return [_copy_event(item) for item in self._replay]
 
     def publish(self, message: dict[str, Any]) -> None:
         dead: list[EventSink] = []
@@ -42,6 +68,20 @@ class MulticastJob:
             self.listeners.discard(sink)
 
 
+def _copy_event(message: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(message)
+    segment = payload.get("segment")
+    if isinstance(segment, dict):
+        payload["segment"] = dict(segment)
+        speaker = payload["segment"].get("speaker")
+        if isinstance(speaker, dict):
+            payload["segment"]["speaker"] = dict(speaker)
+    mapping = payload.get("mapping")
+    if isinstance(mapping, dict):
+        payload["mapping"] = dict(mapping)
+    return payload
+
+
 class MulticastRuntimeRegistry:
     """Keeps multicast jobs alive across WebSocket disconnect/reconnect."""
 
@@ -51,10 +91,14 @@ class MulticastRuntimeRegistry:
         *,
         max_jobs: int = 8,
         persist_path: Path | None = None,
+        output_dir: Path | None = None,
+        sensitive_filter: SensitiveWordFilter | None = None,
     ) -> None:
         self._session_manager = session_manager
         self._max_jobs = max_jobs
         self._persist_path = persist_path
+        self._output_dir = Path(output_dir) if output_dir is not None else None
+        self._sensitive_filter = sensitive_filter or SensitiveWordFilter([])
         self._jobs: dict[tuple[str, int], MulticastJob] = {}
         self._lock = asyncio.Lock()
 
@@ -65,6 +109,9 @@ class MulticastRuntimeRegistry:
         的 session 会悬在已被丢弃的旧池上。
         """
         self._session_manager = manager
+
+    def set_sensitive_filter(self, sensitive_filter: SensitiveWordFilter) -> None:
+        self._sensitive_filter = sensitive_filter
 
     @property
     def max_jobs(self) -> int:
@@ -85,6 +132,7 @@ class MulticastRuntimeRegistry:
                 "packets_received": job.audio_source.packets_received,
                 "frames_emitted": job.audio_source.frames_emitted,
                 "heartbeats_sent": job.audio_source.heartbeats_sent,
+                "transcript_sentences": len(job.transcript),
             }
             for (group, port), job in sorted(self._jobs.items())
         ]
@@ -108,11 +156,12 @@ class MulticastRuntimeRegistry:
                 if listener is not None:
                     existing.listeners.add(listener)
                 _logger.info(
-                    "multicast job reattached %s:%d lane=%d listeners=%d",
+                    "multicast job reattached %s:%d lane=%d listeners=%d sentences=%d",
                     group,
                     port,
                     existing.session.lane_id,
                     len(existing.listeners),
+                    len(existing.transcript),
                 )
                 return existing
 
@@ -209,22 +258,33 @@ class MulticastRuntimeRegistry:
                     await job.audio_task
             with contextlib.suppress(Exception):
                 await job.audio_source.stop()
-            self._session_manager.push_audio(job.session, None)
+            # 与 /ws/stream 一致：结束帧 + stop，避免长会议排空整条 Qwen 队列
+            self._session_manager.signal_finish(job.session)
             try:
                 await asyncio.wait_for(
                     job.session.finished_event.wait(),
-                    timeout=self._session_manager._lifecycle_timeout_seconds,
+                    timeout=self._session_manager.finish_grace_seconds,
                 )
             except asyncio.TimeoutError:
                 _logger.warning("multicast job finish timed out %s:%d", group, port)
-            await self._session_manager.stop_session(job.session)
+            await self._session_manager.stop_session(
+                job.session, reason="finish", wait_timeout=5.0
+            )
+            # 收尾事件已写入 job.transcript，再落盘
+            job.transcript_path = self._write_transcript(job)
             # 收尾事件投递完毕，这时才摘除并断掉监听
             if self._jobs.get(key) is job:
                 self._jobs.pop(key, None)
             job.listeners.clear()
             if update_persist:
                 self._save_persisted()
-            _logger.info("multicast job stopped %s:%d", group, port)
+            _logger.info(
+                "multicast job stopped %s:%d sentences=%d path=%s",
+                group,
+                port,
+                len(job.transcript),
+                job.transcript_path,
+            )
             return job
 
     async def stop_all(self) -> None:
@@ -264,6 +324,33 @@ class MulticastRuntimeRegistry:
             port=new_port if new_port is not None else old_port,
             **params,
         )
+
+    def _write_transcript(self, job: MulticastJob) -> Path | None:
+        if self._output_dir is None or not job.transcript:
+            return None
+        full_text = job.transcript.render()
+        if not full_text:
+            return None
+        transcript_dir = self._output_dir / "transcripts"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        path = transcript_dir / (
+            f"spacemit-asr-lane{job.session.lane_id}-{int(time.time() * 1000)}.txt"
+        )
+        path.write_text(full_text, encoding="utf-8")
+        return path
+
+    def _apply_sensitive(self, message: dict[str, Any]) -> dict[str, Any]:
+        if message.get("type") != "transcript":
+            return message
+        segment = message.get("segment")
+        if not isinstance(segment, dict) or not segment.get("text"):
+            return message
+        filtered = self._sensitive_filter.filter(str(segment["text"]))
+        if filtered == segment["text"]:
+            return message
+        payload = _copy_event(message)
+        payload["segment"]["text"] = filtered
+        return payload
 
     def _save_persisted(self) -> None:
         """把当前在跑的组播地址落盘，供服务重启后自动恢复。"""
@@ -332,7 +419,10 @@ class MulticastRuntimeRegistry:
         job = self._jobs.get(key)
         if job is None:
             return
-        job.publish(message)
+        # 先记入 job（无 WS 也留），再推给当前 listeners
+        prepared = self._apply_sensitive(message)
+        job.record_event(prepared)
+        job.publish(prepared)
 
     async def _audio_loop(self, key: tuple[str, int]) -> None:
         job = self._jobs.get(key)

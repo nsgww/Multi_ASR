@@ -107,7 +107,7 @@ ws://<板子IP>:8000/ws/multicast?group=224.2.110.220&port=6020&wakeup=false
 
 事件流与 `/ws/stream` 相同：`transcript`（partial/final）、`speaker_remap`、`status` 等。
 
-**WS 断开不会停止任务**；「停止收听」只是摘掉自己这个 listener。
+**WS 断开不会停止任务**；「停止收听」只是摘掉自己这个 listener。转写缓冲挂在任务上：断线期间的 final 仍会累积；重连挂回时会回放已定稿句子；`finish` / `POST /v1/multicast/stop` 按任务全文落盘到 `output/transcripts/`。
 
 > WS 消息级切换组播地址（`set_multicast_group`）见 [组播地址修改接口说明.md](组播地址修改接口说明.md)。
 

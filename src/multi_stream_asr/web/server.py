@@ -328,13 +328,15 @@ def create_app(
         # /api/models/load 通道热改会整体换掉 session 池；所有运行期引用
         # 必须走 app.state，闭包缓存初始实例会在热改后指向旧池
         return app.state.session_manager
+    summary_cfg = summary_config or load_summary_config(app_config.summary_config_path)
+    sensitive_filter = SensitiveWordFilter.from_file(app_config.sensitive_words_file)
     multicast_runtime = MulticastRuntimeRegistry(
         manager,
         max_jobs=app_config.max_concurrent_sessions,
         persist_path=app_config.output_dir / "multicast_jobs.json",
+        output_dir=app_config.output_dir,
+        sensitive_filter=sensitive_filter,
     )
-    summary_cfg = summary_config or load_summary_config(app_config.summary_config_path)
-    sensitive_filter = SensitiveWordFilter.from_file(app_config.sensitive_words_file)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -797,7 +799,15 @@ def create_app(
                 status_code=404,
                 detail=f"组播任务不存在: {request.group}:{request.port}",
             )
-        return {"ok": True, "group": request.group, "port": request.port}
+        response: dict[str, Any] = {
+            "ok": True,
+            "group": request.group,
+            "port": request.port,
+            "sentences": len(job.transcript),
+        }
+        if job.transcript_path is not None:
+            response["transcript"] = str(job.transcript_path)
+        return response
 
     @app.post("/v1/multicast/modify")
     async def modify_multicast(request: MulticastModifyRequest) -> dict[str, Any]:

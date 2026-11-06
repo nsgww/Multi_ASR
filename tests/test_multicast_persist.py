@@ -30,11 +30,15 @@ class _StubSource:
 
 class _StubSessionManager:
     _lifecycle_timeout_seconds = 1.0
+    finish_grace_seconds = 1.0
 
     def push_audio(self, session, pcm) -> None:  # noqa: ANN001
         pass
 
-    async def stop_session(self, session) -> None:  # noqa: ANN001
+    def signal_finish(self, session) -> None:  # noqa: ANN001
+        self.push_audio(session, None)
+
+    async def stop_session(self, session, **kwargs) -> None:  # noqa: ANN001
         pass
 
 

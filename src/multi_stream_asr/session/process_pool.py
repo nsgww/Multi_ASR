@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import queue
 import time
 from dataclasses import dataclass, field
@@ -74,6 +75,11 @@ class ProcessPoolSessionManager:
         self._lifecycle_lock = asyncio.Lock()
         self._lifecycle_timeout_seconds = (
             config.shared_qwen.request_timeout_ms / 1000.0 + 5.0
+        )
+        # 用户点结束时给离线尾巴的宽限；长会议积压可能很多，不能按单次
+        # Qwen 120s 去等整条队列，否则前端会「转圈两分钟再断开」。
+        self._finish_grace_seconds = float(
+            os.getenv("FINISH_GRACE_SECONDS", "25")
         )
 
     @property
@@ -272,15 +278,34 @@ class ProcessPoolSessionManager:
             raise RuntimeError("session start timed out") from None
         session.started = True
 
-    async def stop_session(self, session: Session) -> None:
+    async def stop_session(
+        self,
+        session: Session,
+        *,
+        reason: str = "user_requested",
+        wait_timeout: float | None = None,
+    ) -> None:
         async with self._lock:
-            await self._stop_session(session, reason="user_requested")
+            await self._stop_session(
+                session, reason=reason, wait_timeout=wait_timeout
+            )
 
-    async def _stop_session(self, session: Session, *, reason: str) -> None:
+    async def _stop_session(
+        self,
+        session: Session,
+        *,
+        reason: str,
+        wait_timeout: float | None = None,
+    ) -> None:
         if session.lane_id not in self._sessions:
             return
         controller = session.controller
         retired = False
+        timeout = (
+            self._lifecycle_timeout_seconds
+            if wait_timeout is None
+            else max(1.0, float(wait_timeout))
+        )
         if (
             session.started
             and not session.finished_event.is_set()
@@ -296,7 +321,7 @@ class ProcessPoolSessionManager:
             try:
                 await asyncio.wait_for(
                     session.finished_event.wait(),
-                    timeout=self._lifecycle_timeout_seconds,
+                    timeout=timeout,
                 )
             except asyncio.TimeoutError:
                 _logger.warning(
@@ -355,6 +380,26 @@ class ProcessPoolSessionManager:
             audio_queue.put_nowait(data)
         except queue.Full:
             _logger.warning("audio queue full for lane %d; dropping audio", session.lane_id)
+
+    @property
+    def finish_grace_seconds(self) -> float:
+        return max(1.0, float(self._finish_grace_seconds))
+
+    def signal_finish(self, session: Session) -> None:
+        """结束本轮：塞结束帧，并立刻 stop 取消离线积压。
+
+        只 ``push None`` 会走自然收尾，长会议要把整条 Qwen 队列排完才
+        ``lane_finished``，前端会长时间转圈。这里叠加 ``stop``，让 lane
+        ``cancel_offline_tasks``，在宽限内尽快结束。
+        """
+        with contextlib.suppress(Exception):
+            self.push_audio(session, None)
+        try:
+            session.controller.send({"type": "stop", "reason": "finish"})
+        except Exception:
+            _logger.exception(
+                "failed to signal finish/stop to lane %d", session.lane_id
+            )
 
     # -- lane event reader -------------------------------------------------
 

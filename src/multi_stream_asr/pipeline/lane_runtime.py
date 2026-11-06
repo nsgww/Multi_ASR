@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import queue
 import time
 import traceback
@@ -592,8 +593,9 @@ class LaneRuntime:
                 on_kws=report_kws,
                 speaker_tracker=self._create_speaker_tracker(),
                 on_speaker=report_speaker,
-                offline_tail_timeout_seconds=(
-                    self.app_config.shared_qwen.request_timeout_ms / 1000.0
+                # 与 pipeline 默认一致：长会议收尾不能按单次 Qwen 120s 排整队
+                offline_tail_timeout_seconds=float(
+                    os.getenv("OFFLINE_TAIL_TIMEOUT_SECONDS", "25")
                 ),
             )
             self._runtime_stop_requested = False
