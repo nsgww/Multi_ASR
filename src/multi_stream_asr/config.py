@@ -11,21 +11,21 @@ MAX_LANES = 8
 SUPPORTED_LANES = tuple(range(MIN_LANES, MAX_LANES + 1))
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ONLINE_MODEL_DIR = Path(
-    "/var/lib/sm-sdk/models/asr/"
+    "/var/lib/models/speech/asr/"
     "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
 )
-DEFAULT_OFFLINE_MODEL_DIR = Path("/var/lib/sm-sdk/models/asr/qwen3asr")
+DEFAULT_OFFLINE_MODEL_DIR = Path("/var/lib/models/speech/asr/qwen3asr")
 DEFAULT_INPUT_DIR = Path(__file__).resolve().parent / "assets" / "wav16k"
-DEFAULT_VAD_MODEL_DIR = Path("/var/lib/sm-sdk/models/vad/silero-vad/v5")
-DEFAULT_OFFLINE_ASR_MODEL_DIR = Path("/var/lib/sm-sdk/models/asr/sensevoice")
+DEFAULT_VAD_MODEL_DIR = Path("/var/lib/models/speech/vad/silero-vad/v5")
+DEFAULT_OFFLINE_ASR_MODEL_DIR = Path("/var/lib/models/speech/asr/sensevoice")
 DEFAULT_SUMMARY_CONFIG_PATH = PROJECT_ROOT / "summary.yaml"
 DEFAULT_KWS_MODEL_DIR = Path(
-    "/var/lib/sm-sdk/models/kws/"
+    "/var/lib/models/speech/kws/"
     "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
 )
 DEFAULT_KWS_KEYWORDS_FILE = PROJECT_ROOT / "config" / "keywords.txt"
 DEFAULT_SPEAKER_MODEL_PATH = Path(
-    "/var/lib/sm-sdk/models/speaker/"
+    "/var/lib/models/speech/speaker/"
     "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
 )
 ZIPFORMER_WARMUP_AUDIO_PATH = (
@@ -118,6 +118,18 @@ class OfflineModelSpec:
 
 
 OFFLINE_MODELS = {
+    # lg-store/OpenStore 分发的 1.7B 包：text gguf 命名 -text-q40
+    # （与 /var/lib 旧包的 -text-q4km 命名不同，按目录实际文件匹配）
+    "qwen3-asr-1.7b-q40-lgstore": OfflineModelSpec(
+        model_id="qwen3-asr-1.7b-q40-lgstore",
+        model_dir=Path("/var/lib/models/speech/asr/qwen3asr-1.7b"),
+        text_model_filename="Qwen3-ASR-1.7B-text-q40.gguf",
+        frontend_filename="Qwen3-ASR-1.7B-encoder-frontend.dynq.onnx",
+        backend_filename="Qwen3-ASR-1.7B-encoder-backend.dynq.onnx",
+        d_model=1024,
+        hidden_size=2048,
+        output_dim=2048,
+    ),
     "qwen3-asr-0.6b-q40": OfflineModelSpec(
         model_id="qwen3-asr-0.6b-q40",
         model_dir=DEFAULT_OFFLINE_MODEL_DIR,
@@ -130,7 +142,7 @@ OFFLINE_MODELS = {
     ),
     "qwen3-asr-1.7b-q4km": OfflineModelSpec(
         model_id="qwen3-asr-1.7b-q4km",
-        model_dir=Path("/var/lib/sm-sdk/models/asr/qwen3asr-1.7b"),
+        model_dir=Path("/var/lib/models/speech/asr/qwen3asr-1.7b"),
         text_model_filename="Qwen3-ASR-1.7B-text-q4km.gguf",
         frontend_filename="Qwen3-ASR-1.7B-encoder-frontend.dynq.onnx",
         backend_filename="Qwen3-ASR-1.7B-encoder-backend.dynq.onnx",
@@ -141,7 +153,7 @@ OFFLINE_MODELS = {
     # SpacemiT 官方转换的 1.7B 生产包（2026-08-04 启用，替换 0.6B 以提升准确率）
     "qwen3-asr-1.7b-q40": OfflineModelSpec(
         model_id="qwen3-asr-1.7b-q40",
-        model_dir=Path("/var/lib/sm-sdk/models/asr/qwen3asr-1.7b"),
+        model_dir=Path("/var/lib/models/speech/asr/qwen3asr-1.7b"),
         text_model_filename="Qwen3-ASR-1.7B-text-q4km.gguf",
         frontend_filename="Qwen3-ASR-1.7B-encoder-frontend.dynq.onnx",
         backend_filename="Qwen3-ASR-1.7B-encoder-backend.dynq.onnx",
@@ -223,11 +235,15 @@ class EndpointConfig:
     # rule1（纯静音空端点，must_contain_nonsilence=False）必须保持远大于句间停顿：
     # 它每 ~rule1 秒周期性触发空文本端点，端点换流时会吃掉下一句的开头
     # （1.0s 时间隔的连续句子实测丢开头/整句）。设为 60s 等价于禁用，
-    # 真正的句切由 rule2（含语音、0.7s 尾部静音）承担。
+    # 真正的句切由 rule2（含语音、尾部静音）承担。
     rule1_min_trailing_silence: float = 60.0
-    rule2_min_trailing_silence: float = 0.7
+    # 0.7s 会把句中换气/逗号停顿误判句尾（一句话切碎）；1.3s 覆盖正常
+    # 句中停顿，代价是句尾出结果多等 ~0.6s
+    rule2_min_trailing_silence: float = 1.3
     rule3_min_utterance_length: float = 10.0
-    cut_margin_seconds: float = 0.1
+    # 校正音频切分余量：0.1s 太紧会切掉词头词尾（上下句缺失）；
+    # 硬约束必须 < rule2_min_trailing_silence
+    cut_margin_seconds: float = 0.4
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.cut_margin_seconds) or not (
@@ -243,11 +259,11 @@ class EndpointConfig:
 class ModelConfig:
     online_model_dir: Path = DEFAULT_ONLINE_MODEL_DIR
     # 2026-08-04 起默认使用官方 1.7B（热词能力+准确率更好）；
-    # 回退 0.6B：环境变量 OFFLINE_MODEL_DIR=/var/lib/sm-sdk/models/asr/qwen3asr
+    # 回退 0.6B：环境变量 OFFLINE_MODEL_DIR=/var/lib/models/speech/asr/qwen3asr
     # （规格按目录内容自动匹配，offline_model_id 只是兜底）
     offline_model_id: str = os.getenv("OFFLINE_MODEL_ID", "qwen3-asr-1.7b-q4km")
     offline_model_dir: Path = Path(
-        os.getenv("OFFLINE_MODEL_DIR", "/var/lib/sm-sdk/models/asr/qwen3asr-1.7b")
+        os.getenv("OFFLINE_MODEL_DIR", "/var/lib/models/speech/asr/qwen3asr-1.7b")
     )
     online_num_threads: int = 1
 

@@ -50,6 +50,19 @@ def _is_noise_text(text: str) -> bool:
     return clean in _NOISE_WORDS or bool(_NOISE_TEXT_RE.match(clean))
 
 
+# LLM 式 ASR 的重复退化：同一 2~12 字片段连续重复 6 次及以上
+# （如"用那个，"×79、"不断推进，"×20）。正常口语重复（"可以吗"×3）
+# 不会命中。
+_DEGENERATE_REPEAT_RE = re.compile(r"(.{2,12}?)\1{5,}")
+
+
+def _has_repetition_degeneration(text: str) -> bool:
+    """校正输出是否出现重复退化（模型进入无限重复循环）。"""
+    if not text:
+        return False
+    return _DEGENERATE_REPEAT_RE.search(text) is not None
+
+
 from multi_stream_asr.models import (
     ASREvent,
     AudioFrame,
@@ -868,8 +881,26 @@ class LanePipeline:
                             request=error.failure.to_payload(),
                         )
                     )
+                # 校正失败不能无声无息：回退在线识别文本发 FINAL，
+                # 否则前端永远停在"校正中"
+                self._publish_event(
+                    sentence_id=sentence_id,
+                    revision=revision,
+                    status=EventStatus.FINAL,
+                    text=prompt,
+                    timestamp_ms=timestamp_ms,
+                    speaker=speaker,
+                )
                 return
             if result is None:
+                self._publish_event(
+                    sentence_id=sentence_id,
+                    revision=revision,
+                    status=EventStatus.FINAL,
+                    text=prompt,
+                    timestamp_ms=timestamp_ms,
+                    speaker=speaker,
+                )
                 return
 
             if self.on_qwen_success is not None:
@@ -909,11 +940,27 @@ class LanePipeline:
                 rtf=result.rtf,
                 raw_response=result.raw_response,
             )
+            # 校正文本不可用时的回退：空文本/纯空白，或重复退化
+            # （0.6B 对含糊/无意义音频的常见行为：进入无限重复循环），
+            # 回退在线识别文本，避免前端显示成片的重复内容
+            corrected = (result.text or "").strip()
+            if not corrected:
+                final_text = prompt
+            elif _has_repetition_degeneration(corrected):
+                _logger.warning(
+                    "sentence %s 校正输出重复退化（len=%d），回退在线文本: %.40s",
+                    sentence_id,
+                    len(corrected),
+                    corrected,
+                )
+                final_text = prompt
+            else:
+                final_text = corrected
             self._publish_event(
                 sentence_id=sentence_id,
                 revision=revision,
                 status=EventStatus.FINAL,
-                text=result.text,
+                text=final_text,
                 timestamp_ms=timestamp_ms,
                 speaker=speaker,
             )

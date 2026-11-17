@@ -23,6 +23,15 @@ HOTWORDS_PROMPT_PREFIX = "热词："
 # 模型偶尔会把热词提示语整句"回声"进转写结果，需要剥掉
 _HOTWORDS_ECHO_RE = re.compile(r"热词：[^。\n]*。?")
 
+# 繁转简（0.6B 校正模型简繁输出不稳定时的兜底；opencc 为可选依赖，
+# 未安装时保持原样不报错）
+try:
+    from opencc import OpenCC
+
+    _t2s = OpenCC("t2s").convert
+except Exception:  # noqa: BLE401
+    _t2s = None
+
 
 def build_hotwords_user_prompt(hotwords: tuple[str, ...]) -> str:
     """构造带热词引导的 user 文本。
@@ -283,6 +292,9 @@ class Qwen3AsrClient:
             if hotwords:
                 # 剥掉热词提示语回声；整段都是回声时回退到在线识别文本
                 text = strip_hotwords_echo(text, fallback=prompt)
+            # 校正模型简繁输出不稳定，统一繁转简（<1ms/句，可忽略）
+            if _t2s:
+                text = _t2s(text)
 
         elapsed_ms = (time.monotonic() - started) * 1000.0
         rtf = elapsed_ms / (audio_seconds * 1000.0) if audio_seconds > 0 else 0.0
