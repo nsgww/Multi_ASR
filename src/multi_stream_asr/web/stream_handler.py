@@ -214,6 +214,8 @@ class StreamHandler:
         if self._started:
             await self._send(msg.error_message("transcription already started"))
             return
+        # 记录开始转写的墙钟时间，落盘文件名用
+        self._started_at = time.time()
         # config is optional: connection query params already declare sample_rate,
         # and channels=1/width=2 is the only supported format.
         if self._session is None:
@@ -319,9 +321,10 @@ class StreamHandler:
         await self._outgoing_queue.put(message)
 
     def _transcript_filename(self) -> str:
-        ts = int(time.time() * 1000)
+        start_ts = getattr(self, "_started_at", None) or time.time()
+        stamp = time.strftime("%Y%m%d-%H%M", time.localtime(start_ts))
         lane = self._session.lane_id if self._session is not None else 0
-        return f"spacemit-asr-lane{lane}-{ts}.txt"
+        return f"stream-lane{lane}-{stamp}.txt"
 
     async def _save_transcript(self) -> Path | None:
         if not self._transcript:

@@ -33,6 +33,8 @@ class MulticastJob:
     listeners: set[EventSink] = field(default_factory=set)
     finished: bool = False
     wakeup_active: bool = False
+    # 任务创建（开始转写）的墙钟时间，用于落盘文件名里的开始时间戳
+    created_at: float = field(default_factory=time.time)
     # 转写挂在 job 上：WS 断线后任务继续跑时仍记句，重连可回放、结束可全文落盘
     transcript: TranscriptBuffer = field(default_factory=TranscriptBuffer)
     transcript_path: Path | None = None
@@ -328,9 +330,8 @@ class MulticastRuntimeRegistry:
             return None
         transcript_dir = self._output_dir / "transcripts"
         transcript_dir.mkdir(parents=True, exist_ok=True)
-        path = transcript_dir / (
-            f"spacemit-asr-lane{job.session.lane_id}-{int(time.time() * 1000)}.txt"
-        )
+        start_stamp = time.strftime("%Y%m%d-%H%M", time.localtime(job.created_at))
+        path = transcript_dir / f"multicast-lane{job.session.lane_id}-{start_stamp}.txt"
         path.write_text(full_text, encoding="utf-8")
         return path
 

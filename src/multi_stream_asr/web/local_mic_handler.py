@@ -80,6 +80,8 @@ class LocalMicHandler:
             return
 
         try:
+            # 记录开始转写的墙钟时间，落盘文件名用
+            self._started_at = time.time()
             self._session = await self._session_manager.create_session(
                 on_event=self._on_session_event,
                 input_sample_rate=self._sample_rate,
@@ -368,8 +370,9 @@ class LocalMicHandler:
         await self._outgoing_queue.put(message)
 
     def _transcript_filename(self, lane_id: int) -> str:
-        ts = int(time.time() * 1000)
-        return f"spacemit-asr-lane{lane_id}-{ts}.txt"
+        start_ts = getattr(self, "_started_at", None) or time.time()
+        stamp = time.strftime("%Y%m%d-%H%M", time.localtime(start_ts))
+        return f"local_mic-lane{lane_id}-{stamp}.txt"
 
     async def _save_transcript(self) -> Path | None:
         if not self._transcript:

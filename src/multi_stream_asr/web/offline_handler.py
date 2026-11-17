@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import logging
+import time
 import wave
 from pathlib import Path
 from typing import Any
@@ -67,9 +68,9 @@ def _simple_resample(pcm: np.ndarray, input_rate: int, output_rate: int) -> np.n
     return (pcm[floor_idx] * (1 - frac) + pcm[ceil_idx] * frac).astype(pcm.dtype)
 
 
-def _transcript_filename(original_filename: str, lane_id: int) -> str:
-    base = Path(original_filename).stem
-    return f"{base}-lane{lane_id}.txt"
+def _transcript_filename(original_filename: str, lane_id: int, started_at: float) -> str:
+    stamp = time.strftime("%Y%m%d-%H%M", time.localtime(started_at))
+    return f"offline-lane{lane_id}-{stamp}.txt"
 
 
 def _chunk_pcm(
@@ -113,6 +114,8 @@ class OfflineTranscriptionHandler:
         self._summary_config = summary_config
         self._lane_id = lane_id
         self._sensitive_filter = sensitive_filter or SensitiveWordFilter([])
+        # 记录开始转写的墙钟时间，落盘文件名用
+        self._started_at = time.time()
         self._transcript_dir = Path(config.output_dir) / "transcripts"
         self._transcript_dir.mkdir(parents=True, exist_ok=True)
 
@@ -219,7 +222,7 @@ class OfflineTranscriptionHandler:
             recognizer.close()
 
         full_text = _join_full_text(full_texts)
-        transcript_filename = _transcript_filename(filename, self._lane_id)
+        transcript_filename = _transcript_filename(filename, self._lane_id, self._started_at)
         transcript_path = self._transcript_dir / transcript_filename
         await asyncio.to_thread(transcript_path.write_text, full_text, encoding="utf-8")
 

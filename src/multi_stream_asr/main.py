@@ -10,6 +10,7 @@ import uvicorn
 
 from multi_stream_asr.config import AppConfig, SpeakerConfig
 from multi_stream_asr.headless.runner import HeadlessRunner
+from multi_stream_asr.role_runtime import apply_role_overrides
 from multi_stream_asr.web.server import create_app
 
 
@@ -74,24 +75,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 async def _run_async(args: argparse.Namespace) -> int:
-    config = AppConfig(
-        lanes=args.lanes,
-        input_dir=args.input_dir,
-        verbose=args.verbose,
-        speaker=build_speaker_config(args),
+    config = apply_role_overrides(
+        AppConfig(
+            lanes=args.lanes,
+            input_dir=args.input_dir,
+            verbose=args.verbose,
+            speaker=build_speaker_config(args),
+        )
     )
     runner = HeadlessRunner(config=config, fake=args.fake)
     return await runner.run()
 
 
 def _run_web(args: argparse.Namespace) -> int:
-    config = AppConfig(
-        lanes=args.lanes,
-        input_dir=args.input_dir,
-        verbose=args.verbose,
-        web_port=args.port,
-        max_concurrent_sessions=args.lanes,
-        speaker=build_speaker_config(args),
+    config = apply_role_overrides(
+        AppConfig(
+            lanes=args.lanes,
+            input_dir=args.input_dir,
+            verbose=args.verbose,
+            web_port=args.port,
+            max_concurrent_sessions=args.lanes,
+            speaker=build_speaker_config(args),
+        )
     )
     app = create_app(config=config)
     uvicorn.run(app, host=args.host, port=args.port)

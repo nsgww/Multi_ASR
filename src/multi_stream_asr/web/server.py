@@ -4,9 +4,13 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
+import shlex
+import subprocess
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -43,6 +47,13 @@ from multi_stream_asr.config import (
     validate_offline_model_files,
 )
 from multi_stream_asr.pipeline.state import PipelineState
+from multi_stream_asr.role_runtime import (
+    DEFAULT_ROLES_PATH,
+    ROLE_LLM_SUMMARY,
+    load_current_roles,
+    resolve_role_gguf,
+    resolve_runtime_model_dir,
+)
 from multi_stream_asr.session.process_pool import ProcessPoolSessionManager
 from multi_stream_asr.speaker import SherpaSpeakerEmbedder, VoiceprintRegistry
 from multi_stream_asr.speaker.audio import wav_bytes_to_pcm16k
@@ -164,10 +175,15 @@ def _meeting_item_from_transcript(
         text = ""
     speaker_stats = _parse_speaker_stats(text) if text else {"speaker_count": 0, "speakers": []}
     line_count = sum(1 for line in text.splitlines() if line.strip() and not line.strip().startswith("#"))
+    if filename.startswith("spacemit-asr-lane"):
+        source = "unknown"  # 旧版文件名无来源信息
+    else:
+        source = filename.split("-", 1)[0]
     item: dict[str, Any] = {
         "id": filename.rsplit(".", 1)[0],
         "filename": filename,
         "title": filename.rsplit(".", 1)[0],
+        "source": source,
         "bytes": int(stat.st_size),
         "mtime": int(stat.st_mtime),
         "mtime_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)),
@@ -310,6 +326,65 @@ async def _close_websockets(event_bus: FrontendEventBus) -> None:
         event_bus.unregister(websocket)
 
 
+# OpenStore 换模对接：支持热加载回调的 role（speaker 声纹不在
+# current-roles.json 里，维持现状）。所有 role 的统一实现是重启本服务，
+# 启动时 apply_role_overrides 按 current-roles.json 加载新模型。
+RELOADABLE_ROLES = ("streaming-asr", "qwen3-asr", "vad", "kws", "offline-asr", "speaker")
+
+
+class RoleReloadRequest(BaseModel):
+    role: str
+    version: str | None = None
+    runtimePath: str | None = None
+
+
+def _merge_role_runtime_path(
+    role: str, runtime_path: str, version: str | None
+) -> None:
+    """把请求携带的 runtimePath 合入 current-roles.json，保证重启后生效。"""
+    try:
+        raw = json.loads(DEFAULT_ROLES_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=500, detail=f"current-roles.json 不可读: {exc}"
+        ) from exc
+    roles = raw.setdefault("roles", {})
+    entry = roles.setdefault(role, {})
+    if not isinstance(entry, dict):
+        entry = {}
+        roles[role] = entry
+    entry["runtimePath"] = runtime_path
+    if version:
+        entry["runtimeVersion"] = version
+    entry["switchedAt"] = datetime.now(timezone.utc).astimezone().isoformat(
+        timespec="seconds"
+    )
+    try:
+        DEFAULT_ROLES_PATH.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"current-roles.json 不可写: {exc}"
+        ) from exc
+
+
+def _trigger_service_restart() -> None:
+    """延迟 1s 重启本服务：让 /reload 的响应先 flush 给 nginx/OpenStore；
+    start_new_session 让重启命令脱离本服务进程树，服务被杀后仍能执行。"""
+    password = os.getenv("MODEL_SWITCH_SUDO_PASSWORD", "bianbu")
+    subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            "sleep 1; echo {pw} | sudo -S systemctl restart multi-stream-asr".format(
+                pw=shlex.quote(password)
+            ),
+        ],
+        start_new_session=True,
+    )
+
+
 def create_app(
     config: AppConfig | None = None,
     *,
@@ -329,6 +404,12 @@ def create_app(
         # 必须走 app.state，闭包缓存初始实例会在热改后指向旧池
         return app.state.session_manager
     summary_cfg = summary_config or load_summary_config(app_config.summary_config_path)
+    # llm-summary role 接管：OpenStore 切换 role 后（配合 /reload 重启），
+    # 纪要模型跟随 current-roles.json；解析失败则回退 summary.yaml 的路径
+    summary_gguf = resolve_role_gguf(ROLE_LLM_SUMMARY)
+    if summary_gguf and summary_cfg.provider == "llama":
+        summary_cfg = replace(summary_cfg, model_path=Path(summary_gguf))
+        _logger.info("llm-summary role -> %s", summary_gguf)
     sensitive_filter = SensitiveWordFilter.from_file(app_config.sensitive_words_file)
     multicast_runtime = MulticastRuntimeRegistry(
         manager,
@@ -419,6 +500,40 @@ def create_app(
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return _status_payload(app)
+
+    @app.post("/reload")
+    async def reload_models(request: RoleReloadRequest) -> dict[str, Any]:
+        """OpenStore 换模回调。校验 role 与 runtimePath 后重启本服务；
+        重启后启动逻辑会按 current-roles.json（或请求携带的 runtimePath）
+        加载新模型。返回 2xx 表示已接受，模型在重启完成后生效。"""
+        if request.role not in RELOADABLE_ROLES:
+            raise HTTPException(
+                status_code=400, detail=f"unsupported role: {request.role}"
+            )
+        runtime_path = (request.runtimePath or "").strip()
+        if runtime_path:
+            # 与 current-roles.json 一致则无需写（该文件由 OpenStore 管理，
+            # 本服务通常无写权限）；不一致才尝试合入
+            if runtime_path != load_current_roles().get(request.role):
+                _merge_role_runtime_path(request.role, runtime_path, request.version)
+        else:
+            runtime_path = load_current_roles().get(request.role, "")
+        if not runtime_path:
+            raise HTTPException(
+                status_code=400, detail=f"no runtimePath for role {request.role}"
+            )
+        model_dir = resolve_runtime_model_dir(runtime_path)
+        if model_dir is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"runtimePath 下无模型文件: {runtime_path}",
+            )
+        _trigger_service_restart()
+        return {
+            "status": "restarting",
+            "role": request.role,
+            "model_dir": str(model_dir),
+        }
 
     @app.post("/api/models/validate")
     async def validate_models(request: LoadModelsRequest | None = None) -> dict[str, Any]:
@@ -977,44 +1092,43 @@ def create_app(
 
     # 2026-10-28 起暂时停用本机麦克风入口（多设备抢板载 mic 会互相干扰）；
     # 恢复时取消下面这段的注释即可。
-    # @app.websocket("/ws/local_mic")
-    # async def websocket_local_mic(websocket: WebSocket) -> None:
-    #     params = websocket.query_params
-    #     try:
-    #         sample_rate = int(params.get("sample_rate", "16000"))
-    #     except ValueError:
-    #         sample_rate = 16000
-    #     if sample_rate <= 0:
-    #         sample_rate = 16000
-    #     device_raw = params.get("device")
-    #     if device_raw is None:
-    #         device: int | str | None = None
-    #     else:
-    #         try:
-    #             device = int(device_raw)
-    #         except ValueError:
-    #             device = device_raw
-    #     try:
-    #         chunk = int(params.get("chunk", "512"))
-    #     except ValueError:
-    #         chunk = 512
-    #     if chunk <= 0:
-    #         chunk = 512
-    #     wakeup_enabled = params.get("wakeup", "true").lower() not in ("0", "false", "no")
-    #     handler = LocalMicHandler(
-    #         websocket=websocket,
-    #         session_manager=manager,
-    #         summary_config=summary_cfg,
-    #         output_dir=app_config.output_dir,
-    #         device=device,
-    #         sample_rate=sample_rate,
-    #         chunk=chunk,
-    #         wakeup_enabled=wakeup_enabled,
-    #         sensitive_filter=sensitive_filter,
-    #         wakeup_settings=wakeup_settings,
-    #     )
-    #     await handler.run()
-    _ = LocalMicHandler  # 保留 import，路由恢复时直接用
+    @app.websocket("/ws/local_mic")
+    async def websocket_local_mic(websocket: WebSocket) -> None:
+        params = websocket.query_params
+        try:
+            sample_rate = int(params.get("sample_rate", "16000"))
+        except ValueError:
+            sample_rate = 16000
+        if sample_rate <= 0:
+            sample_rate = 16000
+        device_raw = params.get("device")
+        if device_raw is None:
+            device: int | str | None = None
+        else:
+            try:
+                device = int(device_raw)
+            except ValueError:
+                device = device_raw
+        try:
+            chunk = int(params.get("chunk", "512"))
+        except ValueError:
+            chunk = 512
+        if chunk <= 0:
+            chunk = 512
+        wakeup_enabled = params.get("wakeup", "true").lower() not in ("0", "false", "no")
+        handler = LocalMicHandler(
+            websocket=websocket,
+            session_manager=_live_manager(),
+            summary_config=summary_cfg,
+            output_dir=app_config.output_dir,
+            device=device,
+            sample_rate=sample_rate,
+            chunk=chunk,
+            wakeup_enabled=wakeup_enabled,
+            sensitive_filter=sensitive_filter,
+            wakeup_settings=wakeup_settings,
+        )
+        await handler.run()
 
     @app.post("/v1/audio/transcriptions")
     async def audio_transcriptions(

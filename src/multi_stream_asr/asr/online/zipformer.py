@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -232,7 +233,16 @@ def write_zipformer_provider_config(
     lanes: int,
 ) -> Path:
     intra_threads = 1
-    config_path = model_dir / f"lane-{stream_id}" / "zipformer.config"
+    # lg-store 等只读模型目录（root 属主）下不能建 lane-N 子目录，
+    # 配置写到用户可写的缓存目录；路径通过 provider_config 传给识别器，
+    # 与模型文件位置无关。
+    base = Path(
+        os.getenv(
+            "MULTI_STREAM_ASR_LANE_CONFIG_DIR",
+            str(Path.home() / ".cache" / "multi-stream-asr" / "lane-configs"),
+        )
+    )
+    config_path = base / f"lane-{stream_id}" / "zipformer.config"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = config_path.with_suffix(".tmp")
     temporary_path.write_text(
