@@ -15,6 +15,13 @@ from multi_stream_asr.asr.summary.summary_client import SummaryClient
 from multi_stream_asr.asr.text_filter import SensitiveWordFilter
 from multi_stream_asr.session.process_pool import ProcessPoolSessionManager, Session
 from multi_stream_asr.web import messages as msg
+from multi_stream_asr.web.keepalive import (
+    close_websocket_soon,
+    heartbeat_interval_seconds,
+    outgoing_queue_maxsize,
+    relay_outgoing,
+    send_timeout_seconds,
+)
 from multi_stream_asr.web.transcript_buffer import TranscriptBuffer, consume_event
 from multi_stream_asr.web.wakeup_gate import WakeupGate, WakeupSettings
 from multi_stream_asr.web.ws_utils import is_client_disconnect
@@ -51,6 +58,11 @@ class StreamHandler:
         self._paused = False
         self._finished_event = asyncio.Event()
         self._outgoing_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self._heartbeat_seconds = heartbeat_interval_seconds()
+        self._send_timeout = send_timeout_seconds()
+        self._outgoing_maxsize = outgoing_queue_maxsize()
+        self._slow_client_dropped = False
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._send_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -59,6 +71,7 @@ class StreamHandler:
 
     async def run(self) -> None:
         await self._websocket.accept()
+        self._loop = asyncio.get_running_loop()
         self._send_task = asyncio.create_task(self._send_loop())
         self._receive_task = asyncio.create_task(self._receive_loop())
         # Session/lane is allocated on start, not on connect.
@@ -112,11 +125,12 @@ class StreamHandler:
 
     async def _send_loop(self) -> None:
         try:
-            while True:
-                message = await self._outgoing_queue.get()
-                if message is None:
-                    break
-                await self._websocket.send_json(message)
+            await relay_outgoing(
+                self._outgoing_queue,
+                self._websocket.send_json,
+                heartbeat_seconds=self._heartbeat_seconds,
+                send_timeout_seconds=self._send_timeout,
+            )
         except Exception as exc:
             if is_client_disconnect(exc):
                 _logger.info(
@@ -124,7 +138,10 @@ class StreamHandler:
                     self._session.lane_id if self._session else "?",
                 )
             else:
-                _logger.exception("stream send error")
+                # 半开连接：send 卡死或对端已关。必须主动断开，否则
+                # receive 侧可能一直挂着，会话和 lane 都释放不掉。
+                _logger.exception("stream send error; dropping client")
+                self._drop_slow_client()
 
     async def _handle_text(self, text: str) -> None:
         try:
@@ -315,10 +332,36 @@ class StreamHandler:
                     m = dict(m, segment=dict(seg, text=self._sensitive_filter.filter(seg["text"])))
             # final 文本与 speaker_remap 都喂给同一个缓冲，落盘时统一渲染
             consume_event(self._transcript, m)
-            asyncio.create_task(self._outgoing_queue.put(m))
+            self._enqueue(m)
+
+    def _enqueue(self, message: dict[str, Any]) -> None:
+        """非阻塞入队；积压超限说明客户端长期不消费，主动断开。"""
+        if self._slow_client_dropped:
+            return
+        if self._outgoing_queue.qsize() >= self._outgoing_maxsize:
+            _logger.error(
+                "stream outgoing backlog %d >= %d, dropping slow client (lane=%s)",
+                self._outgoing_queue.qsize(),
+                self._outgoing_maxsize,
+                self._session.lane_id if self._session else "?",
+            )
+            self._drop_slow_client()
+            return
+        self._outgoing_queue.put_nowait(message)
+
+    def _drop_slow_client(self) -> None:
+        """断开不再消费的客户端；麦克风会话会随连接结束，这是预期行为。"""
+        if self._slow_client_dropped:
+            return
+        self._slow_client_dropped = True
+        if self._send_task is not None and not self._send_task.done():
+            self._send_task.cancel()
+        if self._loop is None:
+            return
+        close_websocket_soon(self._loop, self._websocket)
 
     async def _send(self, message: dict[str, Any]) -> None:
-        await self._outgoing_queue.put(message)
+        self._enqueue(message)
 
     def _transcript_filename(self) -> str:
         start_ts = getattr(self, "_started_at", None) or time.time()

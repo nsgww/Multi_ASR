@@ -7,6 +7,13 @@ import numpy as np
 
 from multi_stream_asr.models import AudioFrame, OnlineRecognition
 
+# 这两个是板端手工排查脚本，模块级就要读 /tmp 和 /app/lg-store 的真实文件，
+# 被 pytest 收集会直接 FileNotFoundError 并中断整轮回归。保留文件、跳过收集。
+collect_ignore = [
+    "gemma_old_template_test.py",
+    "sensevoice_ab_test.py",
+]
+
 
 def make_frame(
     *,

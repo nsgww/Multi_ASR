@@ -16,6 +16,13 @@ from multi_stream_asr.asr.text_filter import SensitiveWordFilter
 from multi_stream_asr.audio.local_mic import LocalMicSource, find_first_input_device
 from multi_stream_asr.session.process_pool import ProcessPoolSessionManager, Session
 from multi_stream_asr.web import messages as msg
+from multi_stream_asr.web.keepalive import (
+    close_websocket_soon,
+    heartbeat_interval_seconds,
+    outgoing_queue_maxsize,
+    relay_outgoing,
+    send_timeout_seconds,
+)
 from multi_stream_asr.web.transcript_buffer import TranscriptBuffer, consume_event
 from multi_stream_asr.web.wakeup_gate import WakeupGate, WakeupSettings
 from multi_stream_asr.web.ws_utils import is_client_disconnect
@@ -59,6 +66,11 @@ class LocalMicHandler:
         self._send_task: asyncio.Task[None] | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._outgoing_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self._heartbeat_seconds = heartbeat_interval_seconds()
+        self._send_timeout = send_timeout_seconds()
+        self._outgoing_maxsize = outgoing_queue_maxsize()
+        self._slow_client_dropped = False
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._closed = False
         self._started = False
         self._paused = False
@@ -69,6 +81,7 @@ class LocalMicHandler:
 
     async def run(self) -> None:
         await self._websocket.accept()
+        self._loop = asyncio.get_running_loop()
         self._send_task = asyncio.create_task(self._send_loop())
         self._receive_task = asyncio.create_task(self._receive_loop())
 
@@ -355,19 +368,45 @@ class LocalMicHandler:
 
     async def _send_loop(self) -> None:
         try:
-            while True:
-                message = await self._outgoing_queue.get()
-                if message is None:
-                    break
-                await self._websocket.send_json(message)
+            await relay_outgoing(
+                self._outgoing_queue,
+                self._websocket.send_json,
+                heartbeat_seconds=self._heartbeat_seconds,
+                send_timeout_seconds=self._send_timeout,
+            )
         except Exception as exc:
             if is_client_disconnect(exc):
                 _logger.info("local_mic send stopped; client disconnected")
             else:
-                _logger.exception("local_mic send error")
+                _logger.exception("local_mic send error; dropping client")
+                self._drop_slow_client()
+
+    def _enqueue(self, message: dict[str, Any]) -> None:
+        """非阻塞入队；积压超限说明客户端长期不消费，主动断开。"""
+        if self._slow_client_dropped:
+            return
+        if self._outgoing_queue.qsize() >= self._outgoing_maxsize:
+            _logger.error(
+                "local_mic outgoing backlog %d >= %d, dropping slow client",
+                self._outgoing_queue.qsize(),
+                self._outgoing_maxsize,
+            )
+            self._drop_slow_client()
+            return
+        self._outgoing_queue.put_nowait(message)
+
+    def _drop_slow_client(self) -> None:
+        if self._slow_client_dropped:
+            return
+        self._slow_client_dropped = True
+        if self._send_task is not None and not self._send_task.done():
+            self._send_task.cancel()
+        if self._loop is None:
+            return
+        close_websocket_soon(self._loop, self._websocket)
 
     async def _send(self, message: dict[str, Any]) -> None:
-        await self._outgoing_queue.put(message)
+        self._enqueue(message)
 
     def _transcript_filename(self, lane_id: int) -> str:
         start_ts = getattr(self, "_started_at", None) or time.time()

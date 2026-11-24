@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
 from typing import Any
 
@@ -17,6 +18,15 @@ def status_message(status: str, *, lane_id: int | None = None, message: str = ""
 
 def config_ok_message(lane_id: int) -> dict[str, Any]:
     return {"type": "config_ok", "lane_id": lane_id}
+
+
+def heartbeat_message() -> dict[str, Any]:
+    """空闲保活。前端应把它当作"链路还活着"的信号，不要当业务事件展示。
+
+    浏览器 JS 拿不到 WebSocket 协议级 ping/pong，链路半开时页面既没有数据也
+    没有 ``onclose``；只有应用层心跳能让前端做超时判断。
+    """
+    return {"type": "heartbeat", "ts": int(time.time() * 1000)}
 
 
 def transcript_message(event: ASREvent) -> dict[str, Any]:

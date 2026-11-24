@@ -17,6 +17,13 @@ from multi_stream_asr.audio.multicast import (
 )
 from multi_stream_asr.session.process_pool import ProcessPoolSessionManager
 from multi_stream_asr.web import messages as msg
+from multi_stream_asr.web.keepalive import (
+    close_websocket_soon,
+    heartbeat_interval_seconds,
+    outgoing_queue_maxsize,
+    relay_outgoing,
+    send_timeout_seconds,
+)
 from multi_stream_asr.web.multicast_runtime import MulticastJob, MulticastRuntimeRegistry
 from multi_stream_asr.web.wakeup_gate import WakeupGate, WakeupSettings
 from multi_stream_asr.web.ws_utils import is_client_disconnect
@@ -73,6 +80,10 @@ class MulticastHandler:
         self._explicit_finish = False
         self._enable_summary = False
         self._outgoing_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self._heartbeat_seconds = heartbeat_interval_seconds()
+        self._send_timeout = send_timeout_seconds()
+        self._outgoing_maxsize = outgoing_queue_maxsize()
+        self._slow_client_dropped = False
         self._receive_task: asyncio.Task[None] | None = None
         self._send_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -160,11 +171,12 @@ class MulticastHandler:
 
     async def _send_loop(self) -> None:
         try:
-            while True:
-                message = await self._outgoing_queue.get()
-                if message is None:
-                    break
-                await self._websocket.send_json(message)
+            await relay_outgoing(
+                self._outgoing_queue,
+                self._websocket.send_json,
+                heartbeat_seconds=self._heartbeat_seconds,
+                send_timeout_seconds=self._send_timeout,
+            )
         except Exception as exc:
             if is_client_disconnect(exc):
                 _logger.info(
@@ -173,7 +185,14 @@ class MulticastHandler:
                     self._port,
                 )
             else:
-                _logger.exception("multicast send error")
+                # 半开连接：发送卡死时必须主动断开，否则这条 WS 会一直挂着
+                # 消费同一个 job 的事件（job 本身不受影响）。
+                _logger.exception(
+                    "multicast send error; dropping client %s:%d",
+                    self._group,
+                    self._port,
+                )
+                self._drop_slow_client()
 
     async def _handle_text(self, text: str) -> None:
         try:
@@ -350,13 +369,37 @@ class MulticastHandler:
             self._loop.call_soon_threadsafe(self._enqueue, m)
 
     def _enqueue(self, message: dict[str, Any]) -> None:
-        try:
-            self._outgoing_queue.put_nowait(message)
-        except asyncio.QueueFull:
-            pass
+        """非阻塞入队；积压超限说明客户端长期不消费，主动断开。
+
+        组播 job 不随连接结束（``detach`` 只摘监听器），客户端重连后由
+        ``replay_messages`` 补齐，所以断开是安全的。
+        """
+        if self._slow_client_dropped:
+            return
+        if self._outgoing_queue.qsize() >= self._outgoing_maxsize:
+            _logger.error(
+                "multicast outgoing backlog %d >= %d, dropping slow client %s:%d",
+                self._outgoing_queue.qsize(),
+                self._outgoing_maxsize,
+                self._group,
+                self._port,
+            )
+            self._drop_slow_client()
+            return
+        self._outgoing_queue.put_nowait(message)
+
+    def _drop_slow_client(self) -> None:
+        if self._slow_client_dropped:
+            return
+        self._slow_client_dropped = True
+        if self._send_task is not None and not self._send_task.done():
+            self._send_task.cancel()
+        if self._loop is None:
+            return
+        close_websocket_soon(self._loop, self._websocket)
 
     async def _send(self, message: dict[str, Any]) -> None:
-        await self._outgoing_queue.put(message)
+        self._enqueue(message)
 
     async def _maybe_generate_summary(self) -> dict[str, Any] | None:
         if not self._enable_summary:

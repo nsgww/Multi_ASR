@@ -66,6 +66,11 @@ class _StubSessionManager:
     def signal_finish(self, session) -> None:  # noqa: ANN001
         self.push_audio(session, None)
 
+    async def await_finish(self, session) -> bool:  # noqa: ANN001
+        """与真实实现一致：先塞结束帧让 lane 自然收尾，再等 lane_finished。"""
+        self.signal_finish(session)
+        return True
+
     async def stop_session(self, session, **kwargs) -> None:  # noqa: ANN001
         self.stopped.append(session)
         if self._on_stop is not None:

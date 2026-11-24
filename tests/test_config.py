@@ -104,23 +104,23 @@ def test_default_config_values():
     )
     assert config.models.online_num_threads == 1
     assert config.models.online_model_dir == Path(
-        "/var/lib/sm-sdk/models/asr/"
+        "/var/lib/models/speech/asr/"
         "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
     )
     assert config.models.offline_model_dir == Path(
-        "/var/lib/sm-sdk/models/asr/qwen3asr-1.7b"
+        "/var/lib/models/speech/asr/qwen3asr-1.7b"
     )
     assert config.endpoint == EndpointConfig(
         rule1_min_trailing_silence=60.0,
-        rule2_min_trailing_silence=0.7,
+        rule2_min_trailing_silence=1.3,
         rule3_min_utterance_length=10.0,
-        cut_margin_seconds=0.1,
+        cut_margin_seconds=0.4,
     )
     assert config.segment_cache_seconds == 15.0
     assert config.shared_qwen.request_timeout_ms == 120000
 
 
-@pytest.mark.parametrize("margin", [-0.001, 0.7, 0.8, float("nan"), float("inf")])
+@pytest.mark.parametrize("margin", [-0.001, 1.3, 1.4, float("nan"), float("inf")])
 def test_endpoint_rejects_invalid_cut_margin(margin: float):
     with pytest.raises(ValueError, match="cut_margin_seconds"):
         EndpointConfig(cut_margin_seconds=margin)
