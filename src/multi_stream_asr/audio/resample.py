@@ -26,6 +26,11 @@ def _load_libspeexdsp(lib_path: str | Path | None = None) -> ctypes.CDLL:
         [
             "libspeexdsp.so.1",
             "libspeexdsp.so",
+            # 源码编译（./configure --prefix=/usr/local）的默认落点。通常
+            # /usr/local/lib 已在 ld.so.conf 里、上面两条就能命中；这里显式列出，
+            # 是为了装完还没跑 ldconfig 时也能加载。
+            "/usr/local/lib/libspeexdsp.so.1",
+            "/usr/local/lib/libspeexdsp.so",
             "/lib/aarch64-linux-gnu/libspeexdsp.so.1",
             "/usr/lib/aarch64-linux-gnu/libspeexdsp.so.1",
             "/usr/lib/riscv64-linux-gnu/libspeexdsp.so.1",

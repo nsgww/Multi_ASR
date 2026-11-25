@@ -147,12 +147,36 @@ sudo apt update
 sudo apt install -y build-essential autoconf automake libtool pkg-config git
 git clone https://github.com/xiph/speexdsp.git
 cd speexdsp
-./autogen.sh
+./autogen.sh                        # 仓库已带 configure 时这步可跳过，见下
 ./configure --prefix=/usr/local     # 不要加 --disable-shared：代码用 ctypes 动态加载 .so
 make -j$(nproc)
 sudo make install
 sudo ldconfig
 ```
+
+`git clone` 下来的树里**已经带了 `configure` 和 `ltmain.sh`**，所以缺 `libtool`
+（或干脆没装 autotools）时不必 `./autogen.sh`，直接：
+
+```bash
+cd /opt/speexdsp
+./configure --prefix=/usr/local --disable-static --enable-shared
+make -j$(nproc) && make install && ldconfig
+```
+
+验证装好的是源码版而不是 apt 版：
+
+```bash
+ldconfig -p | grep speexdsp        # /usr/local/lib/... 必须排在 /usr/lib/... 之前
+python3 - <<'PY'
+import ctypes
+lib = ctypes.CDLL("libspeexdsp.so.1")
+print([l.split()[-1] for l in open("/proc/self/maps") if "libspeexdsp" in l][0])
+PY
+```
+
+第二段应打印 `/usr/local/lib/libspeexdsp.so.1.x.x`。只要 `/usr/local/lib` 在
+`/etc/ld.so.conf.d/` 里（Bianbu 默认在），`ctypes.CDLL("libspeexdsp.so.1")` 就会
+命中它，**不需要**设 `LIBSPEEXDSP_PATH`；只有装在非标准前缀时才需要。
 
 **库查找顺序**：`speexdsp_lib_path` 参数 → 环境变量 `LIBSPEEXDSP_PATH` → 常见系统路径（含 `/usr/lib/riscv64-linux-gnu/libspeexdsp.so.1`）。都找不到时组播转写报 `SpeexResamplerError`，设置环境变量指向实际路径即可：
 
