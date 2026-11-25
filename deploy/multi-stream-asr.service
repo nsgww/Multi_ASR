@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 User=bianbu
 Group=bianbu
-WorkingDirectory=/opt/multi-stream-asr
-Environment=PYTHONPATH=/opt/multi-stream-asr/src
+WorkingDirectory=/opt/Multi-Stream-ASR
+Environment=PYTHONPATH=/opt/Multi-Stream-ASR/src
 ExecStart=/opt/envs/multi-stream-asr/bin/python -m multi_stream_asr.main --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5
