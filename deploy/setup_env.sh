@@ -38,9 +38,12 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 板端实测需手动补的包（pyproject 未声明）
 "$PIP" install -q \
   "onnxruntime==1.24.2+spacemit.a1" \
-  "funasr_onnx==0.4.3" \
   "PyAudio==0.2.14" \
   "soundfile==0.13.1"
+# funasr_onnx 0.4.3 pin 了 numpy<=1.26.4，与本栈 numpy 2.x 直接冲突——旧板是分批装
+# 绕过的。实测 paraformer 备用路径在 numpy 2.x 下 import/运行正常（线上 zipformer
+# 不依赖它），故 --no-deps 跳过该 pin。
+"$PIP" install -q --no-deps "funasr_onnx==0.4.3"
 
 echo "==> 验证"
 "$PY" -c "import sherpa_onnx, onnxruntime, funasr_onnx, sounddevice; print('env OK:', onnxruntime.__version__)"
