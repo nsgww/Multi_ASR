@@ -7,32 +7,37 @@ set -euo pipefail
 ENV_DIR="${ENV_DIR:-/opt/envs/multi-stream-asr}"
 
 if ! command -v python3.13 >/dev/null 2>&1; then
-  echo "==> 安装系统依赖（python3.13 / portaudio / libsndfile / speexdsp）"
+  echo "==> 安装系统依赖（python3.13 / portaudio / libsndfile / speexdsp / 构建工具）"
   apt-get update -qq
-  apt-get install -y -qq python3.13 python3.13-venv \
+  apt-get install -y -qq python3.13 python3.13-venv python3.13-dev \
+    build-essential cmake \
     libportaudio2 portaudio19-dev libasound2-dev \
     libsndfile1 libspeexdsp1 ca-certificates
 else
   echo "==> python3.13 已存在，跳过 python 安装"
   # 只跳过 python，系统库仍要按需补：缺 libspeexdsp1 会让组播直接
   # SpeexResamplerError，缺 libportaudio2 会让麦克风打不开。
+  #
+  # 先把 ldconfig 输出存进变量再 grep。不能写成 `ldconfig -p | grep -q`：
+  # grep -q 一命中就退出，ldconfig 收到 SIGPIPE 返回非 0，在本脚本的
+  # `set -o pipefail` 下整条管道算失败 —— 结果是库明明装着还会去重装一遍。
+  ld_cache="$(ldconfig -p 2>/dev/null || true)"
   missing_libs=()
-  ldconfig -p 2>/dev/null | grep -q 'libspeexdsp\.so\.1' || missing_libs+=(libspeexdsp1)
-  ldconfig -p 2>/dev/null | grep -q 'libportaudio\.so\.2' || missing_libs+=(libportaudio2)
-  ldconfig -p 2>/dev/null | grep -q 'libsndfile\.so\.1' || missing_libs+=(libsndfile1)
+  grep -q 'libspeexdsp\.so\.1' <<<"$ld_cache" || missing_libs+=(libspeexdsp1)
+  grep -q 'libportaudio\.so\.2' <<<"$ld_cache" || missing_libs+=(libportaudio2)
+  grep -q 'libsndfile\.so\.1' <<<"$ld_cache" || missing_libs+=(libsndfile1)
+  # 编译期依赖：kaldi-native-fbank 与 sentencepiece 在 riscv64 都没有预编译
+  # wheel，只能源码构建，需要 cmake + Python 头文件（g++ 由 build-essential 提供）。
+  command -v cmake >/dev/null 2>&1 || missing_libs+=(cmake)
+  [[ -f /usr/include/python3.13/Python.h ]] || missing_libs+=(python3.13-dev)
   if (( ${#missing_libs[@]} )); then
-    echo "==> 补装系统库: ${missing_libs[*]}"
+    echo "==> 补装系统库/构建依赖: ${missing_libs[*]}"
     if ! { apt-get update -qq && apt-get install -y -qq "${missing_libs[@]}"; }; then
       echo "!! 系统库安装失败，组播/麦克风可能不可用：apt install ${missing_libs[*]}"
     fi
   else
-    echo "==> 系统库齐全（speexdsp / portaudio / sndfile）"
+    echo "==> 系统库齐全（speexdsp / portaudio / sndfile / cmake / python-dev）"
   fi
-  # kaldi-native-fbank 在 riscv64 上没有预编译 wheel 时要源码构建，提前提示
-  for tool in cmake g++; do
-    command -v "$tool" >/dev/null 2>&1 \
-      || echo "   提示: 未找到 $tool，kaldi-native-fbank 源码构建会失败（只影响 paraformer 备用路径）"
-  done
 fi
 
 # 定制 wheel 索引：onnxruntime(33) / sherpa-onnx(81) / 阿里镜像兜底
@@ -57,6 +62,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 板端实测需手动补的包（pyproject 未声明）
 "$PIP" install -q \
   "onnxruntime==1.24.2+spacemit.a1" \
+  "sherpa_onnx==1.13.2" \
   "PyAudio==0.2.14" \
   "soundfile==0.13.1"
 # funasr_onnx 0.4.3 pin 了 numpy<=1.26.4，与本栈 numpy 2.x 直接冲突——旧板是分批装
@@ -71,12 +77,19 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # sentencepiece / scipy / pydub 只在其它入口用到，本项目 paraformer-online 路径不碰，
 # 不装（sentencepiece 还要源码编译，riscv64 上没必要）。
 "$PIP" install -q jieba "PyYAML>=5.1.2"
-if ! "$PIP" install -q kaldi-native-fbank; then
-  echo "!! kaldi-native-fbank 安装失败（riscv64 通常没有预编译 wheel）"
-  echo "   → paraformer 备用识别器不可用，zipformer 主链路不受影响"
-  echo "   → 需要它时先装工具链再重跑："
-  echo "     apt install -y build-essential cmake python3.13-dev"
-fi
+# kaldi-native-fbank（C++ 扩展）与 sentencepiece 在 riscv64 都没有预编译 wheel，
+# 只能现场用 cmake 编译，单个约 1~5 分钟。注意 sentencepiece 不是只有 sensevoice
+# 才用：funasr_onnx/__init__.py 会导入 sensevoice_bin，而它模块级就 import
+# sentencepiece，所以缺了它连 `import funasr_onnx.paraformer_online_bin` 都失败。
+# 两者只服务 paraformer 备用识别器，装不上也不影响 zipformer 主链路。
+for pkg in kaldi-native-fbank sentencepiece; do
+  if ! "$PIP" install -q --no-cache-dir "$pkg"; then
+    echo "!! $pkg 安装失败（riscv64 需源码构建）"
+    echo "   → paraformer 备用识别器不可用，zipformer 主链路不受影响"
+    echo "   → 需要它时先装工具链再重跑："
+    echo "     apt install -y build-essential cmake python3.13-dev"
+  fi
+done
 # librosa 在 riscv64 上装不了（依赖 numba/llvmlite 无 riscv64 wheel），而 funasr_onnx
 # 只在文件加载路径用 librosa.load——写同名桩模块（wave+numpy 实现 load/resample），
 # 与旧板一致；paraformer 为备用识别器，走 PCM 流式路径时不触发。
@@ -120,10 +133,11 @@ echo "==> 验证"
 # 把 zipformer 主链路装完（旧版一条 import 全串在一起，缺 jieba 就整脚本报错）。
 "$PY" - <<'PYEOF'
 import importlib
+import importlib.util
 import sys
 
 required_ok = True
-for name in ("sherpa_onnx", "onnxruntime", "sounddevice"):
+for name in ("sherpa_onnx", "onnxruntime"):
     try:
         module = importlib.import_module(name)
         version = getattr(module, "__version__", "")
@@ -131,6 +145,20 @@ for name in ("sherpa_onnx", "onnxruntime", "sounddevice"):
     except Exception as exc:  # noqa: BLE001 - 装环境脚本要把原因打全
         required_ok = False
         print(f"  [FAIL] {name}: {type(exc).__name__}: {exc}")
+
+# sounddevice 在 import 阶段就会初始化 PortAudio。板上没有音频服务（PulseAudio
+# 未起）或没有声卡时会抛 PortAudioError —— 那不是装坏了，只是本机麦克风链路
+# 不可用（组播/推流两条链路都不碰 PortAudio）。所以这里只判"包在不在"。
+if importlib.util.find_spec("sounddevice") is None:
+    required_ok = False
+    print("  [FAIL] sounddevice: 未安装")
+else:
+    try:
+        module = importlib.import_module("sounddevice")
+        print(f"  [OK]   sounddevice {getattr(module, '__version__', '')}".rstrip())
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [OK]   sounddevice 已安装；PortAudio 未初始化（{type(exc).__name__}）")
+        print("         无声卡/无音频服务时属正常，仅影响本机麦克风输入链路")
 
 for name in ("funasr_onnx.paraformer_online_bin",):
     try:
