@@ -44,6 +44,43 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 绕过的。实测 paraformer 备用路径在 numpy 2.x 下 import/运行正常（线上 zipformer
 # 不依赖它），故 --no-deps 跳过该 pin。
 "$PIP" install -q --no-deps "funasr_onnx==0.4.3"
+# librosa 在 riscv64 上装不了（依赖 numba/llvmlite 无 riscv64 wheel），而 funasr_onnx
+# 只在文件加载路径用 librosa.load——写同名桩模块（wave+numpy 实现 load/resample），
+# 与旧板一致；paraformer 为备用识别器，走 PCM 流式路径时不触发。
+SITE_PKGS="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+if ! "$PY" -c 'import librosa' 2>/dev/null; then
+  cat > "$SITE_PKGS/librosa.py" <<'EOF'
+"""librosa 桩：RISC-V 上 librosa(numba/llvmlite) 装不了。
+funasr_onnx 只在文件加载路径用 librosa.load，这里用 wave+numpy 实现。"""
+import wave
+import numpy as np
+
+__version__ = "0.0-stub"
+
+
+def load(path, sr=16000, mono=True):
+    with wave.open(str(path), "rb") as f:
+        rate = f.getframerate()
+        ch = f.getnchannels()
+        raw = f.readframes(f.getnframes())
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if mono and ch > 1:
+        audio = audio.reshape(-1, ch).mean(axis=1)
+    if sr and rate != sr:
+        x = np.arange(len(audio))
+        xi = np.linspace(0, len(audio) - 1, int(len(audio) * sr / rate))
+        audio = np.interp(xi, x, audio).astype(np.float32)
+    return audio, sr
+
+
+def resample(y, orig_sr, target_sr):
+    y = np.asarray(y, dtype=np.float32)
+    x = np.arange(len(y))
+    xi = np.linspace(0, len(y) - 1, int(len(y) * target_sr / orig_sr))
+    return np.interp(xi, x, y).astype(np.float32)
+EOF
+  echo "==> 已写入 librosa 桩模块（riscv64 无 numba，funasr 文件加载路径专用）"
+fi
 
 echo "==> 验证"
 "$PY" -c "import sherpa_onnx, onnxruntime, funasr_onnx, sounddevice; print('env OK:', onnxruntime.__version__)"
