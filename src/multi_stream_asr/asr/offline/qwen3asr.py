@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
+import logging
 import io
 import re
 import time
@@ -13,6 +15,8 @@ import numpy as np
 
 from multi_stream_asr.asr.offline.base import OfflineRecognitionResult
 from multi_stream_asr.config import SharedQwenConfig
+
+_logger = logging.getLogger(__name__)
 
 
 QWEN_USER_PROMPT = "language Chinese<asr_text>"
@@ -31,6 +35,38 @@ try:
     _t2s = OpenCC("t2s").convert
 except Exception:  # noqa: BLE401
     _t2s = None
+
+
+def anchor_hotwords(
+    online: str, corrected: str, hotwords: tuple[str, ...]
+) -> str:
+    """热词锚定：校正结果不得把在线文本已识别出的热词改错。
+
+    zipformer 的热词偏置是强约束（命中即对），而 1.7B 校正对"热词："提示
+    只是软服从（2026-11-26 实测：热词"朗吉"在在线文本正确的情况下被校正
+    成"朗极/榄吉"同音错字）。逐热词检查：在线文本含该词而校正结果不含
+    → 按同位置替换回热词。
+
+    保守策略：仅当校正与在线等长时按位置替换（同音频重打分绝大多数等长）；
+    长度不一致说明模型做了增删，位置对齐不可靠，跳过不强行修。
+    """
+    if not online or not corrected or online == corrected:
+        return corrected
+    if len(online) != len(corrected):
+        return corrected
+    out = corrected
+    for w in hotwords:
+        if len(w) < 2 or w not in online:
+            continue
+        start = 0
+        while True:
+            i = online.find(w, start)
+            if i < 0:
+                break
+            if out[i : i + len(w)] != w:
+                out = out[:i] + w + out[i + len(w) :]
+            start = i + len(w)
+    return out
 
 
 def build_hotwords_user_prompt(hotwords: tuple[str, ...]) -> str:
@@ -207,6 +243,13 @@ class Qwen3AsrClient:
         if not result.text and self._hotwords:
             # 1.7B 对"长热词表+短音频"会返回空（2026-08-04 实测），无热词重试一次
             result = await self._recognize_once(pcm, prompt, ())
+        if result.text and self._hotwords and prompt:
+            anchored = anchor_hotwords(prompt, result.text, self._hotwords)
+            if anchored != result.text:
+                _logger.info(
+                    "hotword anchored: %r -> %r", result.text, anchored,
+                )
+                result = dataclasses.replace(result, text=anchored)
         return result
 
     async def _recognize_once(
